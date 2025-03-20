@@ -5,7 +5,7 @@
 
 ## 环境配置：
 
-推荐使用Python 3.10
+推荐使用[Python 3.10](https://www.python.org/downloads/release/python-3100/)
 
 你需要在电脑上安装CUDA
 
