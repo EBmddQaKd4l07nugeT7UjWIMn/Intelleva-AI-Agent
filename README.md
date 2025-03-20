@@ -1,3 +1,4 @@
-# AI-based-digital-human-video-generation-tool
-# 基于AI的数字人视频生成工具
+# AI Assistant
+# AI助手
+灵感来源于Manus
 （未完待续）
