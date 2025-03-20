@@ -1,4 +1,4 @@
-# Intelleva 智跃AI助手
+# Intelleva AI Agent
 灵感来源于最近爆火的Manus
 
 环境配置：
