@@ -1,5 +1,5 @@
 # Intelleva AI Agent
 
-The inspiration comes from the recently popular Manus
+Intelleva is an intelligent AI agent that learns from your keyboard and mouse interactions to understand and replicate your behavior through advanced neural networks and cognitive architecture.
 
 (To be continued)
