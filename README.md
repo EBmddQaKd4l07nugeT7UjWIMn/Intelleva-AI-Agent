@@ -7,7 +7,7 @@ Intelleva是一个AI代理，它通过学习您的键盘和鼠标交互来理解
 
 推荐使用[Python 3.10.0](https://www.python.org/downloads/release/python-3100/)
 
-你需要在电脑上安装CUDA
+你需要在电脑上安装[CUDA](https://developer.nvidia.com/cuda-toolkit)和[PyTorch](https://pytorch.org/get-started/locally/)
 
 ## 功能描述：
 
