@@ -1,7 +1,7 @@
 # Intelleva AI Agent
 [Switch to English](https://github.com/EBmddQaKd4l07nugeT7UjWIMn/Intelleva-AI-Agent/blob/main/README_EN.md)
 
-Intelleva是一个AI代理，它通过学习您的键盘和鼠标交互来理解和复制您的行为，采用先进的神经网络和认知架构技术。
+Intelleva是一个AI代理，它会学习您的电脑屏幕画面和键盘和键鼠操作。
 
 ## 环境配置：
 
