@@ -17,7 +17,7 @@ AI会学习电脑屏幕画面和键鼠操作。
 
 Ctrl+Alt：从训练模式切换为学习模式。
 
-## 如果您有疑问，可以问AI：
+## 如果您有任何疑问，可以问AI：
 
 [https://aistudio.google.com/prompts/new_chat](https://aistudio.google.com/prompts/new_chat)
 
