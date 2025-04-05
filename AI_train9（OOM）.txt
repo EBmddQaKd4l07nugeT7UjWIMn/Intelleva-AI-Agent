@@ -1,0 +1,2521 @@
+import os
+import json
+import time
+import gc
+import random
+import shutil
+from pathlib import Path
+from datetime import timedelta
+import traceback
+import platform
+from collections import deque
+import warnings
+import pickle
+import sys
+import math
+from typing import Tuple, Optional, List, Dict, Any, Union, NamedTuple # Added type hints & NamedTuple
+import numpy as np
+import pandas as pd
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    import torch.nn.functional as F
+    from torch.amp import autocast, GradScaler # Use torch.amp directly
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    from torch.utils.data import Dataset, DataLoader, Subset
+    from torchvision import transforms
+    try:
+        import timm
+        TIMM_AVAILABLE = True
+        timm_version = tuple(map(int, timm.__version__.split('.')[:2]))
+        print(f"Found 'timm' library (version: {timm.__version__}) for Vision Transformer models.")
+    except ImportError:
+        print("ERROR: 'timm' library not found. This script requires ViT models.")
+        print("Install with: pip install timm")
+        print("Script cannot proceed without 'timm'. Exiting.")
+        sys.exit(1)
+    from PIL import Image, UnidentifiedImageError, ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True # Allow loading truncated images
+    try:
+        from safetensors.torch import load_file as load_safetensors_file
+        SAFETENSORS_AVAILABLE = True
+        print("Found 'safetensors' library.")
+    except ImportError:
+        SAFETENSORS_AVAILABLE = False
+        print("Warning: 'safetensors' library not found. Will rely on torch.load for .bin files (less secure).")
+        print("         Install with: pip install safetensors")
+except ImportError as e:
+    print(f"ERROR: Missing required library: {e.name}")
+    print("Please install the necessary libraries:")
+    print("pip install torch torchvision torchaudio pandas numpy Pillow timm safetensors")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: An unexpected error occurred during initial imports: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+# --- Constants and Configuration ---
+SCRIPT_DIR = Path(__file__).parent.resolve()
+EXPERIENCE_POOL_DIR = SCRIPT_DIR / "experience_pool"
+SCREENSHOT_DIR = EXPERIENCE_POOL_DIR / "screenshots"
+KEYBOARD_LOG_FILE = EXPERIENCE_POOL_DIR / "keyboard_log.jsonl"
+MOUSE_LOG_FILE = EXPERIENCE_POOL_DIR / "mouse_log.jsonl"
+RESULTS_LOG_FILE = EXPERIENCE_POOL_DIR / "results_log.jsonl"
+PRETRAINED_MODEL_DIR = SCRIPT_DIR / "pretrained_models"
+KEYBOARD_MODEL_FILE = SCRIPT_DIR / "keyboard_ai_model_transformer.pth"
+MOUSE_MODEL_FILE = SCRIPT_DIR / "mouse_ai_model_transformer.pth"
+OLD_KEYBOARD_MODEL_FILE = SCRIPT_DIR / "keyboard_ai_model_transformer_old.pth"
+OLD_MOUSE_MODEL_FILE = SCRIPT_DIR / "mouse_ai_model_transformer_old.pth"
+
+# --- Environment Verification ---
+print("\n--- Verifying Environment ---")
+essential_paths = {
+    "Experience Pool Dir": EXPERIENCE_POOL_DIR,
+    "Screenshots Dir": SCREENSHOT_DIR,
+    "Keyboard Log": KEYBOARD_LOG_FILE,
+    "Mouse Log": MOUSE_LOG_FILE,
+    "Results Log": RESULTS_LOG_FILE,
+    "Pretrained Models Dir": PRETRAINED_MODEL_DIR,
+}
+found_missing_critical = False
+for name, path in essential_paths.items():
+    is_dir = "Dir" in name
+    exists = path.is_dir() if is_dir else path.is_file()
+    status = "Found" if exists else "NOT FOUND"
+    print(f"  {name:<25}: {path} ({status})")
+    if not exists:
+        if "Log" in name:
+            if name in ["Keyboard Log", "Mouse Log"]:
+                 print(f"    Warning: Log file '{path.name}' not found. The corresponding AI ('{name.split()[0]}') might not be trainable without data.")
+            else:
+                 print(f"    Warning: Optional log file '{path.name}' not found. Rewards may default to neutral.")
+        elif name in ["Pretrained Models Dir", "Screenshots Dir", "Experience Pool Dir"]:
+             print(f"    ERROR: Critical directory '{path.name}' is missing.")
+             found_missing_critical = True
+
+# Check for pretrained model files specifically
+if PRETRAINED_MODEL_DIR.is_dir():
+    pt_bin = PRETRAINED_MODEL_DIR / "pytorch_model.bin"
+    pt_safe = PRETRAINED_MODEL_DIR / "model.safetensors"
+    pt_bin_exists = pt_bin.is_file()
+    pt_safe_exists = pt_safe.is_file()
+    print(f"  Pretrained '.bin' file      : {pt_bin} ({'Found' if pt_bin_exists else 'NOT FOUND'})")
+    print(f"  Pretrained '.safetensors' file: {pt_safe} ({'Found' if pt_safe_exists else 'NOT FOUND'})")
+    if not pt_bin_exists and not pt_safe_exists:
+        print(f"ERROR: Critical - Neither 'pytorch_model.bin' nor 'model.safetensors' found in {PRETRAINED_MODEL_DIR}.")
+        found_missing_critical = True
+elif not found_missing_critical: # Only print if the dir itself wasn't already missing
+    print(f"ERROR: Critical directory '{PRETRAINED_MODEL_DIR}' is missing.")
+    found_missing_critical = True
+
+if found_missing_critical:
+    print("\nERROR: One or more essential directories or pretrained files are missing. Please correct the paths or files.")
+    sys.exit(1)
+else:
+    print("Environment verification passed (required directories/files found or optional files noted).")
+print("-" * 30)
+
+# --- Model & Training Hyperparameters ---
+VISION_MODEL_NAME = 'vit_small_patch16_224.augreg_in21k_ft_in1k' # Pretrained ViT model
+TILE_SIZE = (224, 224)      # Tile dimensions (Height, Width) - N.B. Timm expects HxW, PyTorch expects CxHxW
+SEQUENCE_LENGTH = 8         # Number of consecutive screenshots per sample
+TRANSFORMER_D_MODEL = 384   # Transformer embedding dimension (should match ViT feature dim or use projection)
+TRANSFORMER_NHEAD = 6       # Number of attention heads in Transformer
+TRANSFORMER_NUM_LAYERS = 4  # Number of Transformer encoder layers
+TRANSFORMER_DIM_FEEDFORWARD = TRANSFORMER_D_MODEL * 4 # Dimension of feedforward layers
+TRANSFORMER_DROPOUT = 0.1   # Dropout rate in Transformer layers and Positional Encoding
+BATCH_SIZE_INITIAL = 4      # Initial batch size (Script does NOT auto-reduce, adjust manually if OOM)
+LEARNING_RATE = 3e-5        # Learning rate for AdamW optimizer
+WEIGHT_DECAY = 1e-4         # Weight decay (L2 regularization) for AdamW
+EPOCHS_MAX = 50             # Maximum number of training epochs
+PATIENCE_EARLY_STOPPING = 7 # Epochs to wait for validation loss improvement before stopping
+GRADIENT_CLIP_VALUE = 1.0   # Max norm for gradient clipping to prevent explosion
+VAL_SPLIT = 0.15            # Proportion of data held out for validation
+TRAINING_TIME_LIMIT_PER_MODEL_SEC = None # Optional: Max training time in seconds per model (e.g., 3600 for 1 hour)
+FORCE_NUM_WORKERS = None    # Optional: Override detected CPU cores for DataLoader (e.g., 0 for main process)
+ADD_DATA_AUGMENTATION = True # Apply simple color jitter augmentation to tiles
+MOUSE_POS_LOSS_WEIGHT = 0.1 # Weighting factor for mouse position loss relative to action loss
+
+# --- DataLoader Configuration ---
+_cpu_count = os.cpu_count() or 1
+# Use fewer workers by default to prevent resource exhaustion, especially with ViT models
+# Heuristic: use up to 4, or half of CPUs if < 8, or 0 for single core / Windows stability
+DEFAULT_NUM_WORKERS_NON_WINDOWS = min(4, _cpu_count // 2) if _cpu_count > 1 else 0
+DEFAULT_NUM_WORKERS = 0 if platform.system() == "Windows" else DEFAULT_NUM_WORKERS_NON_WINDOWS
+NUM_DATALOADER_WORKERS = FORCE_NUM_WORKERS if FORCE_NUM_WORKERS is not None else DEFAULT_NUM_WORKERS
+# Persistent workers generally faster but use more RAM and can cause issues on Windows
+PERSISTENT_WORKERS = (NUM_DATALOADER_WORKERS > 0) and (platform.system() != "Windows")
+PIN_MEMORY = torch.cuda.is_available() # Use pinned memory for faster CPU->GPU transfer if CUDA is available
+print(f"DataLoader Config: Workers={NUM_DATALOADER_WORKERS}, Persistent={PERSISTENT_WORKERS}, PinMemory={PIN_MEMORY}")
+
+# --- Data Alignment & Reward Parameters ---
+ACTION_PREDICTION_WINDOW_MS = 100 # Look for actions within this many ms *after* a screenshot timestamp
+REWARD_LOOKBACK_WINDOW_SEC = 60   # Look back this many seconds *before* a screenshot for the most recent game result
+REWARD_MAPPING = {"win": 1.5, "draw": 1.0, "lose": 0.5, "skip": 1.0} # Weights applied to loss based on game outcome
+# Require enough data for at least one training batch after validation split
+MIN_VALID_SEQUENCES_FOR_TRAINING = max(10, int(BATCH_SIZE_INITIAL / (1.0 - VAL_SPLIT)) + 1, BATCH_SIZE_INITIAL * 2)
+print(f"Minimum *valid sequences* required to attempt training (after alignment): {MIN_VALID_SEQUENCES_FOR_TRAINING}")
+
+# --- Action Vocabulary & Filtering ---
+MAX_PARALLEL_KEYS_OUTPUT = 3 # Max number of keys the Keyboard AI should predict simultaneously (used in inference, not directly enforced in training loss)
+FORBIDDEN_KEYS = { # Keys excluded from keyboard AI vocabulary (modifiers, function keys, etc.)
+    'ctrl', 'ctrl_l', 'ctrl_r', 'alt', 'alt_l', 'alt_r', 'alt_gr',
+    'shift', 'shift_l', 'shift_r', 'caps_lock',
+    'cmd', 'cmd_l', 'cmd_r', 'win', 'meta', 'windows', 'gui', 'gui_l', 'gui_r',
+    'apps', 'menu', 'compose', 'scroll_lock', 'num_lock', 'insert', 'delete',
+    'home', 'end', 'page_up', 'page_down', 'print_screen', 'pause', 'sleep', 'wakeup', 'esc',
+    'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+    'f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19', 'f20', 'f21', 'f22', 'f23', 'f24',
+    'media_volume_mute', 'media_volume_down', 'media_volume_up', 'media_play_pause',
+    'media_previous', 'media_next', 'media_stop',
+    'kana', 'kanji', 'convert', 'nonconvert', 'yen', 'hiragana', 'katakana',
+    'unknown', 'unidentified', None, '', ' ', 'none', 'spacebar', # Include space variations and unknowns
+}
+MOUSE_ACTION_TYPES_TARGET = ['no_action', 'click_left', 'click_right', 'drag_left', 'drag_right'] # Mouse actions the AI will predict
+MOUSE_ACTION_MAPPING = {'click': 'click', 'long_press': 'click', 'drag': 'drag'} # Group similar raw actions from logs
+
+# --- Global Variables for Tiling (set during preprocessing) ---
+SCREEN_RESOLUTION: Optional[Tuple[int, int]] = None # (Width, Height)
+NUM_TILES_M: int = 0          # Number of horizontal tiles (Width-based)
+NUM_TILES_N: int = 0          # Number of vertical tiles (Height-based)
+NUM_TILES_TOTAL: int = 0      # Total number of tiles (M * N)
+
+# --- Utility Functions ---
+def get_screen_resolution(image_path: Path) -> Optional[Tuple[int, int]]:
+    """Infers screen resolution from a sample image file."""
+    global SCREEN_RESOLUTION # Allow modification of the global variable
+    try:
+        # Ensure file exists and is likely a PNG before opening fully
+        if not image_path.is_file() or image_path.suffix.lower() != '.png': return None
+        # Basic PNG header check
+        with open(image_path, 'rb') as img_f: header = img_f.read(8)
+        if not header.startswith(b'\x89PNG\r\n\x1a\n'):
+            print(f"Warning: Sample file {image_path.name} does not have PNG header.")
+            return None
+
+        with Image.open(image_path) as img:
+            res = img.size # Gets (Width, Height)
+            if isinstance(res, tuple) and len(res) == 2 and all(isinstance(d, int) and d > 0 for d in res):
+                print(f"Successfully inferred screen resolution {res} from {image_path.name}")
+                SCREEN_RESOLUTION = res # Set the global variable (W, H)
+                return res
+            else:
+                print(f"Warning: Invalid resolution tuple read from {image_path.name}: {res}")
+    except FileNotFoundError:
+        # This case should be handled by the is_file() check above, but keep for safety
+        print(f"Warning: Sample image for resolution not found (or check failed): {image_path}")
+    except UnidentifiedImageError:
+        print(f"Warning: Could not read sample image (unidentified format or corrupted?): {image_path}")
+    except Exception as e:
+        print(f"Warning: Error inferring screen resolution from {image_path.name}: {e}")
+    return None # Return None if resolution couldn't be determined
+
+def calculate_tiling_parameters(screen_width: int, screen_height: int, tile_width: int, tile_height: int) -> Tuple[int, int, int]:
+    """Calculates the number of tiles needed to cover the screen."""
+    global NUM_TILES_M, NUM_TILES_N, NUM_TILES_TOTAL
+    if not (screen_width > 0 and screen_height > 0 and tile_width > 0 and tile_height > 0):
+        print(f"ERROR: Invalid dimensions for tiling calculation: Screen({screen_width}x{screen_height}), Tile({tile_width}x{tile_height})")
+        NUM_TILES_M, NUM_TILES_N, NUM_TILES_TOTAL = 0, 0, 0
+        return 0, 0, 0
+    # Calculate tiles based on Width / tile_width and Height / tile_height
+    NUM_TILES_M = math.ceil(screen_width / tile_width)  # Horizontal tiles
+    NUM_TILES_N = math.ceil(screen_height / tile_height) # Vertical tiles
+    NUM_TILES_TOTAL = NUM_TILES_M * NUM_TILES_N
+    print(f"Screen Tiling: {NUM_TILES_M} horizontal x {NUM_TILES_N} vertical = {NUM_TILES_TOTAL} total tiles.")
+    return NUM_TILES_M, NUM_TILES_N, NUM_TILES_TOTAL
+
+def load_jsonl(filepath: Path) -> pd.DataFrame:
+    """Loads a JSON Lines file into a pandas DataFrame with error handling."""
+    data = []
+    lines_read = 0
+    invalid_lines = 0
+    if not filepath.exists():
+        print(f"Info: Log file not found: {filepath}. Returning empty DataFrame.")
+        return pd.DataFrame()
+    try:
+        with filepath.open('r', encoding='utf-8', errors='ignore') as f:
+            for i, line in enumerate(f):
+                lines_read += 1
+                line_content = line.strip()
+                if not line_content: continue # Skip empty lines
+                try:
+                    data.append(json.loads(line_content))
+                except json.JSONDecodeError:
+                    invalid_lines += 1
+                    # Log periodically to avoid spamming console
+                    if invalid_lines < 5 or invalid_lines % 1000 == 0:
+                         print(f"Warning: Skipping invalid JSON line {i+1} in {filepath.name} (error {invalid_lines}). Content: '{line_content[:100]}...'")
+
+        print(f"Loaded {len(data)} records from {filepath.name} ({lines_read} lines read, {invalid_lines} invalid lines skipped).")
+        if not data: return pd.DataFrame() # Return empty if no valid data
+
+        df = pd.DataFrame(data)
+        if 'timestamp_ns' not in df.columns:
+            print(f"ERROR: Crucial 'timestamp_ns' column missing in {filepath.name}. Returning empty DataFrame.")
+            return pd.DataFrame()
+
+        initial_rows = len(df)
+        # Convert timestamp to numeric, coercing errors to NaN
+        df['timestamp_ns'] = pd.to_numeric(df['timestamp_ns'], errors='coerce')
+        # Drop rows where timestamp conversion failed
+        df = df.dropna(subset=['timestamp_ns']).copy() # Use copy() after dropna to avoid potential warnings
+        dropped_rows = initial_rows - len(df)
+        if dropped_rows > 0:
+            print(f"Warning: Dropped {dropped_rows} rows from {filepath.name} due to non-numeric 'timestamp_ns'.")
+        if df.empty: return pd.DataFrame() # Return empty if all rows dropped
+
+        # Ensure integer type after dropping NaNs
+        df['timestamp_ns'] = df['timestamp_ns'].astype(np.int64) # Use numpy int64 for compatibility
+
+        # --- Data Type and Column Validation (Specific to file type) ---
+        required_cols = {'timestamp_ns'}
+        if 'keyboard' in filepath.name:
+            required_cols.update(['key_name', 'press_time_ns', 'release_time_ns'])
+            missing_cols = required_cols - set(df.columns)
+            if missing_cols: print(f"Warning: Missing expected keyboard columns in {filepath.name}: {missing_cols}.")
+
+            # Process key_name: fill missing, convert to lower string, strip whitespace
+            if 'key_name' in df.columns:
+                # Use .loc to assign back to the original DataFrame/copy
+                df.loc[:, 'key_name'] = df['key_name'].fillna('').astype(str).str.lower().str.strip()
+            else: df['key_name'] = '' # Add column if missing
+
+            # Process time columns: convert to numeric Int64 (nullable integer)
+            for col in ['press_time_ns', 'release_time_ns']:
+                 if col in df.columns:
+                     # Coerce and use pandas nullable Int64
+                     df.loc[:, col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+                 else: df[col] = pd.NA # Add column if missing
+
+        elif 'mouse' in filepath.name:
+            required_cols.update(['action', 'button', 'start_pos', 'end_pos', 'press_time_ns', 'release_time_ns'])
+            missing_cols = required_cols - set(df.columns)
+            if missing_cols: print(f"Warning: Missing expected mouse columns in {filepath.name}: {missing_cols}.")
+
+            # Process action/button: fill missing, convert to lower string, strip
+            for col in ['action', 'button']:
+                 if col in df.columns:
+                     df.loc[:, col] = df[col].fillna('unknown').astype(str).str.lower().str.strip()
+                 else: df[col] = 'unknown'
+
+            # Process time columns
+            for col in ['press_time_ns', 'release_time_ns']:
+                 if col in df.columns:
+                     df.loc[:, col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+                 else: df[col] = pd.NA
+
+            # Process position columns: ensure they are valid 2-element lists/tuples of numbers
+            def validate_pos(p):
+                if isinstance(p, (list, tuple)) and len(p) == 2:
+                    try:
+                        # Check if both elements are numeric and finite
+                        px, py = map(float, p)
+                        if math.isfinite(px) and math.isfinite(py):
+                            return [px, py] # Return as list of floats
+                    except (ValueError, TypeError): pass # Handle potential conversion errors
+                return None # Return None if invalid
+
+            for col in ['start_pos', 'end_pos']:
+                 if col in df.columns:
+                     # Use .loc to ensure assignment works correctly
+                     df.loc[:, col] = df[col].apply(validate_pos)
+                 else: df[col] = None # Add column if missing
+
+            # Add trajectory if missing
+            if 'trajectory' not in df.columns: df['trajectory'] = None
+            # Ensure action_mapped exists for later use
+            if 'action_mapped' not in df.columns: df['action_mapped'] = 'unknown' # Assign a default string
+
+        elif 'results' in filepath.name:
+            required_cols.add('result')
+            if 'result' not in df.columns: print(f"Warning: Missing expected 'result' column in {filepath.name}.")
+            # Process result: fill missing, convert to lower string, strip
+            if 'result' in df.columns:
+                df.loc[:, 'result'] = df['result'].fillna('unknown').astype(str).str.lower().str.strip()
+            else: df['result'] = 'unknown' # Add column if missing
+
+        return df
+
+    except Exception as e:
+        print(f"ERROR loading or processing {filepath.name}: {e}")
+        traceback.print_exc()
+        return pd.DataFrame() # Return empty DataFrame on major error
+
+def cleanup_memory():
+    """Performs garbage collection and clears CUDA cache if available."""
+    st = time.time()
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            # elapsed = time.time() - st
+            # if elapsed > 0.5: print(f"Debug: Cleared CUDA cache ({elapsed:.2f}s)") # Only print if slow
+        except Exception as e_cleanup_cuda:
+            print(f"Warning: Clearing CUDA cache failed: {e_cleanup_cuda}")
+    # else: # CPU only cleanup is just GC
+        # elapsed = time.time() - st
+        # if elapsed > 0.5: print(f"Debug: GC Collect took {elapsed:.2f}s")
+
+# Define named tuples for clarity in preprocessing return
+class PreprocessingOutput(NamedTuple):
+    df_aligned: Optional[pd.DataFrame] # Data aligned to screenshots where action occurred
+    screenshot_list_full: List[Tuple[int, pd.Timestamp, str, int, int]] # ALL valid screenshots: (df_idx, ts_pd, path, ts_ns, list_pos)
+    key_to_idx: Dict[str, int]
+    idx_to_key: Dict[int, str]
+    mouse_action_to_idx: Dict[str, int]
+    success_flag: bool # Indicates if preprocessing found enough data and was structurally okay
+    screen_resolution: Optional[Tuple[int, int]] # (W, H)
+
+# --- Data Preprocessing ---
+def preprocess_data() -> PreprocessingOutput:
+    """
+    Loads, cleans, aligns screenshot, keyboard, mouse, and result data.
+    Returns a PreprocessingOutput NamedTuple containing aligned data, vocabularies,
+    and metadata. Success_flag indicates if it's suitable to proceed.
+    """
+    global SCREEN_RESOLUTION, NUM_TILES_M, NUM_TILES_N, NUM_TILES_TOTAL # Indicate usage/modification of globals
+    print("\n--- Starting Data Preprocessing ---")
+    t_start = time.time()
+
+    # --- Default return values for failure ---
+    fail_output = PreprocessingOutput(None, [], {}, {}, {}, False, None)
+
+    # 1. Load Raw Data
+    print("Loading log files...")
+    df_keyboard = load_jsonl(KEYBOARD_LOG_FILE)
+    df_mouse = load_jsonl(MOUSE_LOG_FILE)
+    df_results = load_jsonl(RESULTS_LOG_FILE)
+
+    # 2. Scan and Validate Screenshots
+    print(f"Scanning screenshots in {SCREENSHOT_DIR}...")
+    screenshots_raw = [] # List of dicts {'timestamp_ns': int, 'filepath_obj': Path}
+    checked_files = 0
+    png_count = 0
+    invalid_name_count = 0
+
+    if not SCREENSHOT_DIR.is_dir():
+        print(f"ERROR: Screenshot directory not found or not a directory: {SCREENSHOT_DIR}")
+        return fail_output
+
+    try:
+        potential_screenshots = []
+        # Iterate through files, checking for PNG and numeric timestamp name
+        for f in SCREENSHOT_DIR.iterdir():
+            checked_files += 1
+            if f.is_file() and f.suffix.lower() == '.png':
+                png_count += 1
+                try:
+                    ts_str = f.stem
+                    if ts_str.isdigit():
+                        ts_ns = int(ts_str)
+                        # Basic size check to avoid tiny files likely unrelated
+                        if f.stat().st_size > 1024: # Avoid >1KB files? Might be too aggressive
+                            potential_screenshots.append({'timestamp_ns': ts_ns, 'filepath_obj': f})
+                        else:
+                             if invalid_name_count < 5: print(f"Warning: Skipping potential screenshot {f.name} due to small size (<1KB).")
+                             invalid_name_count += 1 # Count small files as skipped invalid
+                    else:
+                        invalid_name_count += 1
+                        if invalid_name_count < 5 or invalid_name_count % 1000 == 0:
+                            print(f"Warning: Skipping screenshot file with non-numeric name: {f.name} (Count: {invalid_name_count})")
+                except (ValueError, TypeError) as e_parse:
+                    print(f"Warning: Skipping screenshot file {f.name} due to timestamp parsing error: {e_parse}")
+                except Exception as e_other:
+                    print(f"Warning: Skipping screenshot file {f.name} due to unexpected error: {e_other}")
+
+        # Sort by timestamp *before* assigning list_pos
+        screenshots_raw = sorted(potential_screenshots, key=lambda x: x['timestamp_ns'])
+
+        # Add list_pos and convert path to string
+        screenshots = [] # List of dicts: {'timestamp_ns', 'filepath', 'path_obj', 'list_pos'}
+        for i, ss_info in enumerate(screenshots_raw):
+            screenshots.append({
+                'timestamp_ns': ss_info['timestamp_ns'],
+                'filepath': str(ss_info['filepath_obj']),
+                'path_obj': ss_info['filepath_obj'], # Keep Path object temporarily for resolution check
+                'list_pos': i # Store the index in the sorted list
+            })
+
+        print(f"Checked {checked_files} files. Found {png_count} PNG files, {len(screenshots)} with valid numeric timestamp names and size > 1KB.")
+        if invalid_name_count > 0: print(f"  ({invalid_name_count} files skipped due to invalid name or small size).")
+    except Exception as e:
+        print(f"ERROR scanning screenshot directory {SCREENSHOT_DIR}: {e}")
+        traceback.print_exc()
+        return fail_output
+
+    if not screenshots:
+        print("ERROR: No valid screenshots found (PNG files with numeric timestamp names and >1KB size). Cannot proceed.")
+        return fail_output
+
+    # 3. Infer Screen Resolution & Calculate Tiling
+    local_screen_resolution = None # Use a local variable first
+    if SCREEN_RESOLUTION is None:
+        print("Attempting to infer screen resolution from the first valid PNG...")
+        # Use the first screenshot in the sorted list (likely earliest, good representative)
+        if screenshots:
+             first_valid_ss = screenshots[0]
+             get_screen_resolution(first_valid_ss['path_obj']) # Tries to set global SCREEN_RESOLUTION
+             if SCREEN_RESOLUTION:
+                  local_screen_resolution = SCREEN_RESOLUTION
+        # Fallback: iterate if the first one failed
+        if local_screen_resolution is None:
+            for ss_info in screenshots[1:]: # Iterate through the rest if first failed
+                 get_screen_resolution(ss_info['path_obj'])
+                 if SCREEN_RESOLUTION:
+                     local_screen_resolution = SCREEN_RESOLUTION; break
+
+        if local_screen_resolution is None:
+            print("ERROR: Could not infer screen resolution from any valid PNG file. Cannot proceed without screen dimensions for tiling.")
+            # Clean up temporary Path objects before returning
+            for ss_info in screenshots: ss_info.pop('path_obj', None)
+            return fail_output # Critical failure
+    else:
+        local_screen_resolution = SCREEN_RESOLUTION
+        print(f"Using pre-set or previously inferred screen resolution: {local_screen_resolution}")
+
+    # Validate the determined resolution and calculate tiling (modifies globals)
+    try:
+        screen_w, screen_h = local_screen_resolution
+        if not (isinstance(screen_w, int) and screen_w > 0 and isinstance(screen_h, int) and screen_h > 0):
+            raise ValueError("Invalid screen resolution components.")
+        # Calculate tiling parameters using TILE_SIZE (H, W) constant
+        # Pass Tile W, H to function which expects W, H order internally for calculation M = ceil(ScreenW/TileW) etc.
+        m_calc, n_calc, total_calc = calculate_tiling_parameters(screen_w, screen_h, TILE_SIZE[1], TILE_SIZE[0])
+        if total_calc == 0:
+             raise ValueError("Tiling calculation resulted in zero tiles.")
+    except (TypeError, ValueError) as e_res:
+        print(f"ERROR: Invalid screen resolution or tiling calculation failed: {local_screen_resolution}. Error: {e_res}. Cannot proceed.")
+        # Clean up temporary Path objects before returning
+        for ss_info in screenshots: ss_info.pop('path_obj', None)
+        # Return resolution even on tiling failure, but flag failure
+        return PreprocessingOutput(None, [], {}, {}, {}, False, local_screen_resolution)
+
+    # 4. Process Timestamps and Convert DataFrames
+    df_screenshots = pd.DataFrame(screenshots)
+    # Drop the temporary Path object column now
+    df_screenshots = df_screenshots.drop(columns=['path_obj'], errors='ignore')
+
+    print("Converting timestamps and validating data...")
+    valid_dfs = {}
+    min_timestamp_overall = pd.Timestamp.max.tz_localize(None) # Use timezone-naive
+    max_timestamp_overall = pd.Timestamp.min.tz_localize(None)
+
+    for df_name, df in [('screenshots', df_screenshots), ('keyboard', df_keyboard), ('mouse', df_mouse), ('results', df_results)]:
+        if df is None or df.empty:
+            print(f"Info: No data loaded for {df_name}.")
+            continue
+        if 'timestamp_ns' not in df.columns:
+            print(f"Warning: 'timestamp_ns' column missing in {df_name} DataFrame. Skipping.")
+            continue
+
+        initial_count = len(df)
+        # Convert nanosecond timestamp to pandas Timestamp object
+        df['timestamp'] = pd.to_datetime(df['timestamp_ns'], unit='ns', errors='coerce')
+
+        # Check for conversion errors
+        failed_conversion_mask = df['timestamp'].isna()
+        dropped_datetime = failed_conversion_mask.sum()
+        if dropped_datetime > 0:
+            print(f"Warning: Dropped {dropped_datetime}/{initial_count} rows from {df_name} due to invalid datetime conversion from timestamp_ns.")
+            # Use copy() to avoid SettingWithCopyWarning on the sliced frame
+            df = df[~failed_conversion_mask].copy()
+
+        if df.empty: # Check if empty *after* dropping NaT
+             print(f"Info: No valid records remaining for {df_name} after timestamp conversion.")
+             continue # Skip to next df if this one became empty
+
+        # Make timezone naive if necessary
+        if pd.api.types.is_datetime64_any_dtype(df['timestamp']) and df['timestamp'].dt.tz is not None:
+            try:
+                df['timestamp'] = df['timestamp'].dt.tz_convert(None)
+            except Exception as e_tz:
+                print(f"Warning: Could not make timestamp column timezone naive for {df_name}: {e_tz}")
+
+        # Store valid dataframe and update overall time range
+        valid_dfs[df_name] = df
+        try:
+            min_ts, max_ts = df['timestamp'].min(), df['timestamp'].max()
+            min_timestamp_overall = min(min_ts, min_timestamp_overall)
+            max_timestamp_overall = max(max_ts, max_timestamp_overall)
+        except Exception as e_ts_range:
+            print(f"Warning: Could not get time range for {df_name}: {e_ts_range}")
+
+    if 'screenshots' not in valid_dfs or valid_dfs['screenshots'].empty:
+        print("ERROR: No valid screenshot data after timestamp processing. Cannot proceed.")
+        return PreprocessingOutput(None, [], {}, {}, {}, False, local_screen_resolution) # Return res, flag fail
+
+    # Reassign potentially modified DataFrames and ensure necessary columns exist
+    df_screenshots = valid_dfs['screenshots']
+    kb_cols = ['timestamp', 'timestamp_ns', 'key_name', 'press_time_ns', 'release_time_ns']
+    df_keyboard = valid_dfs.get('keyboard', pd.DataFrame(columns=kb_cols))
+    for col in kb_cols:
+        if col not in df_keyboard.columns: df_keyboard[col] = pd.NA
+
+    mouse_cols = ['timestamp', 'timestamp_ns', 'action', 'button', 'start_pos', 'end_pos', 'press_time_ns', 'release_time_ns', 'trajectory', 'action_mapped']
+    df_mouse = valid_dfs.get('mouse', pd.DataFrame(columns=mouse_cols))
+    for col in mouse_cols:
+         if col not in df_mouse.columns: df_mouse[col] = pd.NA
+
+    results_cols = ['timestamp', 'timestamp_ns', 'result']
+    df_results = valid_dfs.get('results', pd.DataFrame(columns=results_cols))
+    if 'result' not in df_results.columns: df_results['result'] = pd.NA
+
+
+    # 5. Sort DataFrames by Timestamp (use stable sort for consistency)
+    print("Sorting dataframes by timestamp...")
+    df_screenshots = df_screenshots.sort_values('timestamp', kind='mergesort') # Inplace was deprecated
+    if not df_keyboard.empty: df_keyboard = df_keyboard.sort_values('timestamp', kind='mergesort')
+    if not df_mouse.empty: df_mouse = df_mouse.sort_values('timestamp', kind='mergesort')
+    if not df_results.empty: df_results = df_results.sort_values('timestamp', kind='mergesort')
+
+    # 6. Prepare Reward Map
+    action_window_td = pd.Timedelta(milliseconds=ACTION_PREDICTION_WINDOW_MS)
+    reward_window_td = pd.Timedelta(seconds=REWARD_LOOKBACK_WINDOW_SEC)
+    results_map = None
+    if not df_results.empty and 'result' in df_results.columns and df_results['result'].notna().any():
+        # Make a copy to avoid SettingWithCopyWarning when adding the reward_value column
+        df_results_proc = df_results.dropna(subset=['timestamp', 'result']).copy()
+        df_results_proc['reward_value'] = df_results_proc['result'].map(REWARD_MAPPING).fillna(1.0) # Default 1.0
+
+        if not df_results_proc.empty:
+            # Keep the *last* result for any given timestamp
+            df_results_proc = df_results_proc.drop_duplicates(subset=['timestamp'], keep='last')
+            # Set timestamp as index for efficient lookup
+            results_map = df_results_proc.set_index('timestamp').sort_index()['reward_value']
+            print(f"Created results map with {len(results_map)} entries for reward lookup.")
+        else: print("Info: No valid results data remained after dropping NaT/NaN.")
+        del df_results_proc # Free memory
+    else:
+        print("Info: No valid results data found or 'result' column missing/empty. Using default reward weight 1.0 for all samples.")
+
+    # 7. Build Vocabularies
+    # Keyboard Vocabulary
+    key_to_idx: Dict[str, int] = {}
+    idx_to_key: Dict[int, str] = {}
+    num_keyboard_classes = 0
+    if not df_keyboard.empty and 'key_name' in df_keyboard.columns and df_keyboard['key_name'].notna().any():
+        potential_keys = df_keyboard['key_name'].dropna().astype(str).str.lower().str.strip()
+        # Filter out forbidden keys and empty strings
+        valid_keys_series = potential_keys[~potential_keys.isin(FORBIDDEN_KEYS) & (potential_keys != '')]
+        unique_valid_keys = sorted(list(valid_keys_series.unique()))
+        if unique_valid_keys:
+             key_to_idx = {k: i for i, k in enumerate(unique_valid_keys)}
+             idx_to_key = {v: k for k, v in key_to_idx.items()}
+             num_keyboard_classes = len(key_to_idx)
+             print(f"Keyboard vocabulary size: {num_keyboard_classes} (Valid keys found: {len(unique_valid_keys)})")
+        else: print("Warning: No valid keyboard keys found in logs after filtering forbidden keys.")
+    else: print("Info: No keyboard data or 'key_name' column found. Keyboard vocabulary empty.")
+
+    # Mouse Action Vocabulary
+    mouse_action_to_idx: Dict[str, int] = {'no_action': 0} # Always include no_action at index 0
+    if not df_mouse.empty and 'action' in df_mouse.columns and 'button' in df_mouse.columns:
+        # Work on a copy to avoid warnings if df_mouse is modified later
+        df_mouse_proc = df_mouse.copy()
+        df_mouse_proc['action_mapped'] = df_mouse_proc['action'].map(MOUSE_ACTION_MAPPING).fillna('unknown')
+        df_mouse_proc['action_mapped'] = df_mouse_proc['action_mapped'].astype(str).str.lower().str.strip()
+        df_mouse_proc['button'] = df_mouse_proc['button'].fillna('unknown').astype(str).str.lower().str.strip()
+
+        # Combine mapped action with button
+        combined_actions = df_mouse_proc['action_mapped'] + '_' + df_mouse_proc['button']
+        combined_actions = combined_actions.replace(['unknown_unknown', 'unknown_left', 'unknown_right',
+                                                     'click_unknown', 'drag_unknown'], 'unknown') # Consolidate unknowns
+
+        # Find unique actions present in data that match our targets (excluding no_action)
+        detected_target_actions = set(a for a in combined_actions.unique() if a in MOUSE_ACTION_TYPES_TARGET and a != 'no_action')
+
+        # Build final vocabulary starting with no_action
+        final_mouse_actions = ['no_action'] + sorted(list(detected_target_actions))
+        mouse_action_to_idx = {action: i for i, action in enumerate(final_mouse_actions)}
+
+        # Update the *original* df_mouse with the mapped actions for alignment lookup later
+        # Make sure 'action_mapped' column exists and has the correct mapped values
+        df_mouse['action_mapped'] = df_mouse_proc['action_mapped'] # Assign back from the processed copy
+
+        del df_mouse_proc # Free memory
+    else:
+         print("Info: Mouse data missing or incomplete. Initializing vocabulary with 'no_action' only.")
+
+    num_mouse_action_classes = len(mouse_action_to_idx)
+    if num_mouse_action_classes == 1 and 'no_action' in mouse_action_to_idx:
+         print("Warning: Only 'no_action' will be predicted by Mouse AI (no other valid actions found/mapped).")
+    print(f"Final Mouse action types ({num_mouse_action_classes}): {list(mouse_action_to_idx.keys())}")
+
+
+    # 8. Prepare Action Lookups (using timestamp_ns for indexing)
+    kb_index_col = 'timestamp_ns' # Assume press time is the key event time
+    mouse_index_col = 'timestamp_ns' # Assume press time is the key event time
+    print(f"Using 'press_time_ns' (via timestamp_ns fallback if missing) for keyboard action alignment.")
+    print(f"Using 'press_time_ns' (via timestamp_ns fallback if missing) for mouse action alignment.")
+
+    keyboard_actions = None
+    if not df_keyboard.empty and 'key_name' in df_keyboard.columns:
+        # Prefer press_time_ns if available and valid, otherwise use timestamp_ns
+        if 'press_time_ns' in df_keyboard.columns and df_keyboard['press_time_ns'].notna().any():
+             kb_index_col = 'press_time_ns'
+             print("  Using KB press_time_ns as index.")
+        else:
+             kb_index_col = 'timestamp_ns' # Fallback
+             print("  Warning: KB press_time_ns unavailable/invalid, falling back to timestamp_ns.")
+
+        # Drop rows with NA index column *before* setting index
+        df_keyboard_indexed = df_keyboard.dropna(subset=[kb_index_col])
+        if not df_keyboard_indexed.empty:
+            df_keyboard_indexed = df_keyboard_indexed.astype({kb_index_col: np.int64}) # Ensure int64
+            # Filter for keys in our vocabulary only before indexing
+            df_keyboard_indexed = df_keyboard_indexed[df_keyboard_indexed['key_name'].isin(key_to_idx)]
+            if not df_keyboard_indexed.empty:
+                # Keep last valid key action if multiple occur at the exact same nanosecond
+                df_keyboard_indexed = df_keyboard_indexed.drop_duplicates(subset=[kb_index_col], keep='last')
+                keyboard_actions = df_keyboard_indexed.set_index(kb_index_col).sort_index()
+                print(f"Keyboard actions indexed ({kb_index_col}): {len(keyboard_actions)} entries (filtered for vocab).")
+
+    if keyboard_actions is None or keyboard_actions.empty:
+        print("Warning: Could not create keyboard actions index (no valid data/keys found).")
+        keyboard_actions = None # Ensure it's None if empty
+
+    mouse_actions = None
+    if not df_mouse.empty and 'action_mapped' in df_mouse.columns and num_mouse_action_classes > 1:
+        # Prefer press_time_ns if available, else timestamp_ns
+        if 'press_time_ns' in df_mouse.columns and df_mouse['press_time_ns'].notna().any():
+             mouse_index_col = 'press_time_ns'
+             print("  Using Mouse press_time_ns as index.")
+        else:
+             mouse_index_col = 'timestamp_ns' # Fallback
+             print("  Warning: Mouse press_time_ns unavailable/invalid, falling back to timestamp_ns.")
+
+        df_mouse_indexed = df_mouse.dropna(subset=[mouse_index_col])
+        if not df_mouse_indexed.empty:
+            df_mouse_indexed = df_mouse_indexed.astype({mouse_index_col: np.int64}) # Ensure int64
+            # Recreate combined action for filtering against final vocabulary
+            action_button_combo = df_mouse_indexed['action_mapped'].fillna('unknown') + '_' + df_mouse_indexed['button'].fillna('unknown')
+            action_button_combo = action_button_combo.replace(['unknown_unknown', 'unknown_left', 'unknown_right', 'click_unknown', 'drag_unknown'], 'unknown')
+            # Add the combined action string temporarily for filtering
+            df_mouse_indexed['temp_action_combo'] = action_button_combo
+            # Filter for actions present in our final vocabulary (excluding 'no_action')
+            actions_to_keep = list(a for a in mouse_action_to_idx if a != 'no_action')
+            df_mouse_filtered = df_mouse_indexed[df_mouse_indexed['temp_action_combo'].isin(actions_to_keep)]
+
+            if not df_mouse_filtered.empty:
+                 # Drop temp column
+                 df_mouse_filtered = df_mouse_filtered.drop(columns=['temp_action_combo'])
+                 # Keep last action if multiple occur at the exact same nanosecond
+                 df_mouse_filtered = df_mouse_filtered.drop_duplicates(subset=[mouse_index_col], keep='last')
+                 mouse_actions = df_mouse_filtered.set_index(mouse_index_col).sort_index()
+                 print(f"Mouse actions indexed ({mouse_index_col}): {len(mouse_actions)} entries (filtered for vocab > 1).")
+
+    if mouse_actions is None or mouse_actions.empty:
+        print("Warning: Could not create mouse actions index (no valid data/actions found after filtering).")
+        mouse_actions = None
+
+    # Get index values for faster searchsorted lookup
+    kb_index_vals = keyboard_actions.index.values if keyboard_actions is not None else np.array([], dtype=np.int64)
+    mouse_index_vals = mouse_actions.index.values if mouse_actions is not None else np.array([], dtype=np.int64)
+
+    # 9. Align Actions and Rewards to Screenshots
+    # Create the full list of screenshots with necessary info for the Dataset class
+    # Format: (original_df_index, timestamp_pd, filepath_str, timestamp_ns, list_pos)
+    screenshot_list_full: List[Tuple[int, pd.Timestamp, str, int, int]] = []
+    if not df_screenshots.empty:
+        # Create or ensure 'index' column from DataFrame index
+        df_screenshots_with_idx = df_screenshots.reset_index()
+        iter_cols = ['index', 'timestamp', 'filepath', 'timestamp_ns'] # Use df index, ts, path, ts_ns
+
+        # Verify columns needed exist
+        if not all(col in df_screenshots_with_idx.columns for col in iter_cols):
+            print(f"ERROR: Missing required columns {iter_cols} in df_screenshots for alignment.")
+            return fail_output._replace(screen_resolution=local_screen_resolution) # Return resolution, fail flag
+
+        # Iterate using itertuples for speed
+        for list_pos, row_tuple in enumerate(df_screenshots_with_idx[iter_cols].itertuples(index=False, name=None)):
+             original_df_index, ts_pd, fpath, ts_ns = row_tuple
+             # Basic validation
+             if not (isinstance(original_df_index, int) and isinstance(ts_pd, pd.Timestamp) and isinstance(fpath, str) and isinstance(ts_ns, (int, np.int64))):
+                 print(f"Warning: Skipping screenshot row at list_pos {list_pos} due to invalid data types: {row_tuple}")
+                 continue
+             screenshot_list_full.append((original_df_index, ts_pd, fpath, int(ts_ns), list_pos)) # Ensure ts_ns is standard int
+
+    # Prepare for alignment loop
+    aligned_data = []
+    print("Aligning actions and rewards to screenshots...")
+    skipped_no_action = 0
+    skipped_invalid_mouse_pos = 0
+    total_screenshots = len(screenshot_list_full)
+    start_align_time = time.time()
+    action_window_ns = int(ACTION_PREDICTION_WINDOW_MS * 1e6)
+    no_action_idx_mouse = mouse_action_to_idx.get('no_action', 0)
+
+    # Ensure screen resolution is valid before normalization calculations
+    if local_screen_resolution is None or len(local_screen_resolution) != 2:
+         print("ERROR: Cannot proceed with alignment, screen resolution is invalid.")
+         return fail_output._replace(screen_resolution=local_screen_resolution)
+    screen_w, screen_h = local_screen_resolution
+    if screen_w <= 0 or screen_h <= 0:
+         print(f"ERROR: Cannot proceed with alignment, invalid screen dimensions: {screen_w}x{screen_h}")
+         return fail_output._replace(screen_resolution=local_screen_resolution)
+
+    # --- Alignment Loop ---
+    for df_idx, img_ts_pd, img_path, img_ts_ns, list_pos in screenshot_list_full:
+        # Progress indicator
+        if list_pos % 10000 == 0 and list_pos > 0:
+             elapsed = time.time() - start_align_time
+             rate = list_pos / elapsed if elapsed > 0 else 0
+             eta_sec = (total_screenshots - list_pos) / rate if rate > 0 else 0
+             eta_str = str(timedelta(seconds=int(eta_sec))) if eta_sec > 0 else "N/A"
+             print(f"  Aligning progress: {list_pos}/{total_screenshots} ({rate:.1f} screenshots/sec, ETA: {eta_str})")
+
+        action_window_end_ns = img_ts_ns + action_window_ns
+        reward_window_start_pd = img_ts_pd - reward_window_td
+
+        # --- Find Keyboard Actions in Window ---
+        kb_target_indices: List[int] = [] # Indices corresponding to keys in key_to_idx
+        if keyboard_actions is not None and len(kb_index_vals) > 0:
+            try:
+                # Find indices in the keyboard action log within the time window [img_ts_ns, action_window_end_ns)
+                kb_slice_idx_start = np.searchsorted(kb_index_vals, img_ts_ns, side='left')
+                kb_slice_idx_end = np.searchsorted(kb_index_vals, action_window_end_ns, side='left') # Use 'left' to exclude endpoint
+
+                if kb_slice_idx_start < kb_slice_idx_end:
+                    # Get unique valid key names present in the slice
+                    keys_in_slice = keyboard_actions.iloc[kb_slice_idx_start:kb_slice_idx_end]['key_name'].unique()
+                    # Convert to indices using the vocabulary
+                    kb_target_indices = sorted([key_to_idx[k] for k in keys_in_slice if k in key_to_idx])
+            except Exception as e_kb_align:
+                if list_pos % 5000 == 0: print(f"Warn: Error aligning keyboard action at index {list_pos} (ts {img_ts_ns}): {e_kb_align}")
+
+        # --- Find Mouse Action in Window ---
+        mouse_target_action_idx: int = no_action_idx_mouse
+        mouse_target_pos_normalized: np.ndarray = np.array([0.5, 0.5], dtype=np.float32) # Default center
+
+        if mouse_actions is not None and len(mouse_index_vals) > 0:
+             try:
+                 # Find index of the *first* relevant mouse action starting in the window
+                 mouse_slice_idx_start = np.searchsorted(mouse_index_vals, img_ts_ns, side='left')
+                 mouse_slice_idx_end = np.searchsorted(mouse_index_vals, action_window_end_ns, side='left') # Exclude end
+
+                 if mouse_slice_idx_start < mouse_slice_idx_end:
+                      # Get the *first* action row within the slice
+                      first_action_row = mouse_actions.iloc[mouse_slice_idx_start]
+
+                      # Recreate the combined action string for vocab lookup
+                      action_str = first_action_row.get('action_mapped', 'unknown')
+                      button_str = first_action_row.get('button', 'unknown')
+                      combined_action_str = f"{action_str}_{button_str}".replace('unknown_unknown', 'unknown').replace('unknown_left', 'unknown').replace('unknown_right', 'unknown').replace('click_unknown', 'unknown').replace('drag_unknown', 'unknown')
+
+                      # Check if this action is in our target vocabulary
+                      if combined_action_str in mouse_action_to_idx and combined_action_str != 'no_action':
+                           # Determine which position to use (end for drag, start otherwise)
+                           pos_col_name = 'end_pos' if 'drag' in combined_action_str else 'start_pos'
+                           pos_to_normalize = first_action_row.get(pos_col_name)
+
+                           # Validate and normalize position
+                           if pos_to_normalize is not None: # Check validate_pos already returned valid coords
+                                try:
+                                   px, py = pos_to_normalize # Should be [float, float] from validate_pos
+                                   # Normalize coordinates, clamp strictly to [0, 1]
+                                   x_norm = max(0.0, min(1.0, px / screen_w))
+                                   y_norm = max(0.0, min(1.0, py / screen_h))
+                                   # Update target action index and position
+                                   mouse_target_action_idx = mouse_action_to_idx[combined_action_str]
+                                   mouse_target_pos_normalized = np.array([x_norm, y_norm], dtype=np.float32)
+                                except (TypeError, ValueError, ZeroDivisionError) as e_norm:
+                                   if skipped_invalid_mouse_pos < 5 or skipped_invalid_mouse_pos % 1000 == 0: print(f"Warn: Mouse pos norm error at index {list_pos}: {e_norm} for pos {pos_to_normalize}. Count {skipped_invalid_mouse_pos+1}")
+                                   skipped_invalid_mouse_pos += 1
+                           else: skipped_invalid_mouse_pos += 1 # Skip if pos data invalid/missing from row
+                      # If combined action not in vocab, target remains 'no_action'
+             except Exception as e_mouse_align:
+                 if list_pos % 5000 == 0: print(f"Warn: Error aligning mouse action at index {list_pos} (ts {img_ts_ns}): {e_mouse_align}")
+
+        # --- Determine Reward Weight ---
+        reward_weight = 1.0 # Default weight
+        if results_map is not None:
+             try:
+                 # Find results within the lookback window ending at the screenshot time
+                 if not results_map.index.is_monotonic_increasing:
+                     results_map = results_map.sort_index() # Should be sorted, but ensure
+                 relevant_results = results_map.loc[reward_window_start_pd : img_ts_pd]
+                 if not relevant_results.empty:
+                     # Use the reward value of the *most recent* result in the window
+                     reward_weight = relevant_results.iloc[-1]
+             except KeyError: pass # Handle cases where the slice bounds are outside the index range
+             except Exception as e_reward:
+                 if list_pos % 10000 == 0: print(f"Warning: Error finding reward at index {list_pos}: {e_reward}")
+                 pass # Ignore errors (e.g., key not found), use default weight
+
+        # --- Append Data Point if Any Action Occurred ---
+        # An entry is useful if either a valid keyboard action OR a valid mouse action (not 'no_action') occurred.
+        has_kb_action = bool(kb_target_indices)
+        has_mouse_action = (mouse_target_action_idx != no_action_idx_mouse)
+
+        if has_kb_action or has_mouse_action:
+             aligned_data.append({
+                 'img_path': img_path, # Filepath of the screenshot
+                 'kb_actions': kb_target_indices, # List of KB action indices [0..VocabSize-1]
+                 'mouse_action': mouse_target_action_idx, # Single mouse action index [0..ActionVocabSize-1]
+                 'mouse_pos': mouse_target_pos_normalized.tolist(), # Normalized [x, y] as list [0,1]
+                 'reward_weight': float(reward_weight), # Reward weight multiplier
+                 'original_df_index': df_idx, # Original index from screenshot DataFrame (for tracing)
+                 'list_pos': list_pos # Index in the sorted screenshot_list_full (for sequence building)
+             })
+        else: skipped_no_action += 1 # Count screenshots with no associated action in the window
+
+    # --- Cleanup and Final Report ---
+    del df_keyboard, df_mouse, df_results, df_screenshots # Free memory
+    del keyboard_actions, mouse_actions, results_map # Free memory
+    cleanup_memory()
+
+    t_end = time.time()
+    print(f"--- Data Preprocessing Finished ({t_end - t_start:.2f}s) ---")
+    print(f"Total aligned samples with actions: {len(aligned_data)}")
+    print(f"Screenshots skipped (no relevant actions followed): {skipped_no_action}")
+    if skipped_invalid_mouse_pos > 0: print(f"Mouse actions defaulted due to invalid/missing position data: {skipped_invalid_mouse_pos}")
+
+    if not aligned_data:
+         print(f"\nWARNING: No aligned data points with actions were generated. Training cannot proceed.")
+         # Return success=False, but include vocab/resolution found so far
+         return PreprocessingOutput(None, screenshot_list_full, key_to_idx, idx_to_key, mouse_action_to_idx, False, local_screen_resolution)
+
+    df_aligned = pd.DataFrame(aligned_data)
+    df_aligned['list_pos'] = df_aligned['list_pos'].astype(int) # Ensure integer type
+    return PreprocessingOutput(df_aligned, screenshot_list_full, key_to_idx, idx_to_key, mouse_action_to_idx, True, local_screen_resolution)
+
+
+# --- Dataset Class ---
+class ActionDatasetSequence(Dataset):
+    """
+    Dataset to load sequences of tiled screenshot images and corresponding actions/rewards.
+    Handles padding, tiling, transformation, data augmentation, and robust error handling.
+    """
+    def __init__(self, aligned_data_df: pd.DataFrame,
+                 screenshot_list_full: List[Tuple[int, pd.Timestamp, str, int, int]], # Includes list_pos
+                 sequence_length: int,
+                 tile_size: Tuple[int, int], # (H, W)
+                 screen_resolution: Tuple[int, int], # (W, H)
+                 num_tiles_m: int, num_tiles_n: int, num_tiles_total: int,
+                 target_type: str = 'keyboard', # 'keyboard' or 'mouse'
+                 key_vocab_size: int = 0,
+                 mouse_action_vocab_size: int = 0,
+                 mouse_action_to_idx: Optional[Dict[str, int]] = None,
+                 add_augmentation: bool = False): # Flag to enable/disable augmentation
+
+        if target_type not in ['keyboard', 'mouse']:
+            raise ValueError(f"Invalid target_type: {target_type}. Must be 'keyboard' or 'mouse'.")
+
+        # --- Basic Configuration ---
+        self.sequence_length = sequence_length
+        self.tile_h, self.tile_w = tile_size # Individual tile H, W
+        self.screen_w, self.screen_h = screen_resolution # Full screen W, H
+        self.num_tiles_m = num_tiles_m # Num tiles horizontally
+        self.num_tiles_n = num_tiles_n # Num tiles vertically
+        self.num_tiles_total = num_tiles_total # Total tiles per image
+        self.target_type = target_type
+        self.key_vocab_size = key_vocab_size
+        self.mouse_action_vocab_size = mouse_action_vocab_size
+        self.mouse_action_to_idx = mouse_action_to_idx if mouse_action_to_idx is not None else {}
+        self.add_augmentation = add_augmentation
+        # Get index for 'no_action'
+        self.no_action_idx = self.mouse_action_to_idx.get('no_action', 0)
+
+        # Error tracking for image loading/processing
+        self._load_error_counts = {'not_found': 0, 'unidentified': 0, 'dimension_mismatch': 0, 'tiling_error': 0, 'other': 0}
+        self._max_error_logs_per_type = 5 # Limit console spam
+
+        # --- Transforms ---
+        # Base transforms applied to each PIL tile AFTER potential augmentation
+        base_transforms = [
+            transforms.ToTensor(), # Converts PIL HWC [0,255] to Tensor CHW [0,1]
+            # Normalize with ImageNet mean/std common for ViTs, adjust if your ViT expects different
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            # Alt Normalization (simpler [-1, 1] range):
+            # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ]
+        # Augmentation transform (applied to PIL tile *before* ToTensor/Normalize)
+        if self.add_augmentation:
+            print(f"Dataset '{self.target_type}': Enabling ColorJitter augmentation.")
+            self.augmentation_transform = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+        else:
+            print(f"Dataset '{self.target_type}': Data augmentation disabled.")
+            self.augmentation_transform = None
+        # Compose the final tile transform pipeline
+        self.tile_transform = transforms.Compose(base_transforms)
+
+
+        # --- Store Aligned Data and Build Lookups ---
+        self.aligned_items: List[Dict[str, Any]] = [] # Stores records from aligned_data_df
+        # Lookup from list_pos (index in full screenshot list) -> (original_df_idx, filepath_str)
+        self.screenshot_lookup_by_listpos: Dict[int, Tuple[int, str]] = {}
+        self.valid_indices_in_aligned: List[int] = [] # Stores indices from `self.aligned_items` that are valid END points for sequences
+
+        # Populate Screenshot Lookup from the full list provided by preprocessing
+        if screenshot_list_full:
+            print(f"Building screenshot lookup for {len(screenshot_list_full)} total screenshots...")
+            for df_idx, _ts_pd, path, _ts_ns, list_pos in screenshot_list_full:
+                 if isinstance(list_pos, int):
+                    self.screenshot_lookup_by_listpos[list_pos] = (df_idx, str(path))
+                 else:
+                     print(f"Warning: Invalid non-integer list_pos ({list_pos}) in screenshot_list_full. Skipping lookup entry.")
+        else:
+            print(f"Warning: Initializing {target_type} dataset with empty screenshot_list_full.")
+
+        # Process Aligned Data DataFrame
+        if aligned_data_df is None or aligned_data_df.empty:
+            print(f"Warning: Initializing {target_type} dataset with empty aligned_data_df.")
+        elif not self.screenshot_lookup_by_listpos:
+             print(f"Warning: Initializing {target_type} dataset - screenshot lookup is empty despite having aligned data.")
+        else:
+            try:
+                required_cols_aligned = {'original_df_index', 'list_pos', 'kb_actions', 'mouse_action', 'mouse_pos', 'reward_weight', 'img_path'}
+                if not required_cols_aligned.issubset(aligned_data_df.columns):
+                    raise KeyError(f"Missing expected columns in aligned_data_df: {required_cols_aligned - set(aligned_data_df.columns)}")
+                # Use required columns only to convert to dicts
+                self.aligned_items = aligned_data_df[list(required_cols_aligned)].to_dict('records')
+            except (KeyError, Exception) as e_conv:
+                 print(f"ERROR converting aligned_data_df to records for {target_type} dataset: {e_conv}.")
+                 self.aligned_items = [] # Ensure empty list on error
+
+            # --- Find Valid Sequence Endpoints ---
+            num_aligned = len(self.aligned_items)
+            if num_aligned > 0:
+                print(f"Building valid sequence indices for {target_type} dataset from {num_aligned} aligned samples...")
+                processed_seq_count = 0
+                skipped_missing_listpos = 0
+                for aligned_idx, item in enumerate(self.aligned_items):
+                     # list_pos marks the timestamp of the *target action* (end frame of seq)
+                     target_frame_list_pos = item.get('list_pos')
+
+                     if not isinstance(target_frame_list_pos, int) or target_frame_list_pos < 0:
+                         if skipped_missing_listpos < 5: print(f"Warning: Invalid 'list_pos' ({target_frame_list_pos}) in aligned item {aligned_idx}. Skipping.")
+                         skipped_missing_listpos += 1; continue
+
+                     # Check if enough *preceding* screenshots exist in the full list
+                     if target_frame_list_pos >= self.sequence_length - 1:
+                          # Verify all preceding frames in sequence exist in lookup (were valid screenshots)
+                          sequence_frames_exist = True
+                          for k in range(self.sequence_length):
+                              # Calculate list_pos for the k-th frame in sequence
+                              # Example: SeqLen=5, Target=10. Frames needed: 6,7,8,9,10
+                              # k=0 -> 10 - (5-1-0) = 6
+                              # k=4 -> 10 - (5-1-4) = 10
+                              expected_list_pos = target_frame_list_pos - (self.sequence_length - 1 - k)
+                              if expected_list_pos not in self.screenshot_lookup_by_listpos:
+                                  sequence_frames_exist = False; break
+
+                          if sequence_frames_exist:
+                               self.valid_indices_in_aligned.append(aligned_idx) # Store the index in aligned_items
+                               processed_seq_count +=1
+                               if processed_seq_count % 10000 == 0 and processed_seq_count > 0:
+                                   print(f"  ...found {processed_seq_count} valid sequences")
+
+                if skipped_missing_listpos > 0: print(f"  Warning: Skipped {skipped_missing_listpos} aligned items due to invalid/missing 'list_pos'.")
+                print(f"Finished building valid sequence indices for {target_type}.")
+
+        # --- Report Dataset Stats ---
+        num_valid_seq = len(self.valid_indices_in_aligned)
+        print(f"Dataset '{self.target_type}': Input aligned samples={len(self.aligned_items)}, Found {num_valid_seq} valid sequence end points.")
+        if not self.valid_indices_in_aligned and len(self.aligned_items) > 0:
+            print(f"WARNING: No valid sequences could be formed for {self.target_type} dataset! Check SEQUENCE_LENGTH ({self.sequence_length}) vs data continuity or errors in screenshot list.")
+
+        # --- Precompute Padding ---
+        self.pad_w = (self.num_tiles_m * self.tile_w) - self.screen_w
+        self.pad_h = (self.num_tiles_n * self.tile_h) - self.screen_h
+        # Padding tuple for torchvision.transforms.functional.pad: (left, top, right, bottom)
+        self.padding_tuple = (0, 0, self.pad_w, self.pad_h) # Pad right and bottom
+        if self.pad_w > 0 or self.pad_h > 0:
+            print(f"Dataset '{self.target_type}': Padding image (Right, Bottom): ({self.pad_w}, {self.pad_h})")
+
+        # --- Define Dummy Data for Error Cases ---
+        # Single dummy tile C, H, W
+        self._dummy_tile = torch.zeros((3, self.tile_h, self.tile_w), dtype=torch.float32)
+        if self.num_tiles_total > 0:
+            # Tiles for one image: NumTiles, C, H, W
+            self._dummy_image_tiles = self._dummy_tile.unsqueeze(0).repeat(self.num_tiles_total, 1, 1, 1)
+            # Sequence of tiled images: Seq, NumTiles, C, H, W
+            self._dummy_image_seq = self._dummy_image_tiles.unsqueeze(0).repeat(self.sequence_length, 1, 1, 1, 1)
+        else:
+            print(f"ERROR: num_tiles_total is {self.num_tiles_total} for {self.target_type}. Dummy data creation failed.")
+            self._dummy_image_tiles = torch.empty(0)
+            self._dummy_image_seq = torch.empty(0)
+        # Keyboard Target: (VocabSize) - Multi-hot binary
+        self._dummy_kb_target = torch.zeros(self.key_vocab_size, dtype=torch.float32) if self.key_vocab_size > 0 else torch.empty(0, dtype=torch.float32)
+        # Mouse Target Action: (ActionVocabSize) - One-hot
+        self._dummy_mouse_target_action = torch.zeros(self.mouse_action_vocab_size, dtype=torch.float32) if self.mouse_action_vocab_size > 0 else torch.empty(0, dtype=torch.float32)
+        if self.mouse_action_vocab_size > 0 and 0 <= self.no_action_idx < self.mouse_action_vocab_size:
+             self._dummy_mouse_target_action[self.no_action_idx] = 1.0
+        # Mouse Target Position: (2,) - Normalized [x, y] (default center)
+        self._dummy_mouse_target_pos = torch.tensor([0.5, 0.5], dtype=torch.float32)
+        # Reward Weight: scalar tensor
+        self._dummy_weight = torch.tensor(1.0, dtype=torch.float32)
+
+
+    def __len__(self):
+        """Returns the number of valid sequences."""
+        return len(self.valid_indices_in_aligned)
+
+    def _log_load_error(self, error_type: str, img_path_str: str, details: str = ""):
+        """Logs image loading errors, capped per type."""
+        self._load_error_counts[error_type] += 1
+        count = self._load_error_counts[error_type]
+        if count <= self._max_error_logs_per_type:
+            print(f"Warn [Dataset:{self.target_type} {error_type.capitalize()}]: Fail loading '{Path(img_path_str).name}'. Count: {count}. {details}")
+        elif count % 1000 == 0: # Log periodically after cap
+             print(f"Warn [Dataset:{self.target_type} {error_type.capitalize()}]: Still occurring... Count: {count}.")
+
+    def _load_and_tile_image(self, img_path_str: str) -> Optional[torch.Tensor]:
+        """
+        Loads a single screenshot, checks dimensions, pads, tiles, applies augment/transforms.
+        Returns tensor (NumTiles, C, H, W) or dummy tensor on recoverable errors.
+        Returns None on critical errors (num_tiles_total=0).
+        """
+        if self.num_tiles_total <= 0:
+             self._log_load_error('tiling_error', img_path_str, "NumTiles=0")
+             return None # Critical
+
+        img: Optional[Image.Image] = None
+        try:
+            img_path = Path(img_path_str)
+            if not img_path.is_file():
+                self._log_load_error('not_found', img_path_str)
+                return self._dummy_image_tiles.clone()
+
+            # Open image
+            img = Image.open(img_path)
+
+            # Verify dimensions
+            if img.size != (self.screen_w, self.screen_h):
+                self._log_load_error('dimension_mismatch', img_path_str, f"Expected {self.screen_w}x{self.screen_h}, got {img.size}")
+                img.close(); img = None
+                return self._dummy_image_tiles.clone()
+
+            # Ensure RGB
+            img_rgb = img.convert('RGB')
+            img.close(); img = None # Close original after converting
+
+            # Pad image
+            if self.pad_w > 0 or self.pad_h > 0:
+                # Use reflection padding - generally good visually
+                img_padded = transforms.functional.pad(img_rgb, self.padding_tuple, padding_mode='reflect')
+            else:
+                img_padded = img_rgb
+
+            # --- Tiling Logic ---
+            expected_h_padded = self.num_tiles_n * self.tile_h
+            expected_w_padded = self.num_tiles_m * self.tile_w
+
+            # Verify padded size rigorously (sometimes off by 1px)
+            if img_padded.size != (expected_w_padded, expected_h_padded):
+                # If slightly off, try resizing to force it (fast, low impact)
+                if abs(img_padded.width - expected_w_padded) <= 1 and abs(img_padded.height - expected_h_padded) <= 1:
+                    img_padded = img_padded.resize((expected_w_padded, expected_h_padded), Image.BILINEAR)
+                else:
+                    self._log_load_error('tiling_error', img_path_str, f"Padded size {img_padded.size} != expected {expected_w_padded}x{expected_h_padded}")
+                    del img_padded; # Clean up potentially large padded image object
+                    return self._dummy_image_tiles.clone()
+
+            # Extract tiles directly from the padded PIL image (more efficient than tensor slicing)
+            tiles_pil = []
+            for i in range(self.num_tiles_n): # Rows (Vertical)
+                for j in range(self.num_tiles_m): # Columns (Horizontal)
+                    # Box: (left, upper, right, lower)
+                    box = (j * self.tile_w, i * self.tile_h, (j + 1) * self.tile_w, (i + 1) * self.tile_h)
+                    tiles_pil.append(img_padded.crop(box))
+
+            del img_padded # Free memory
+
+            if len(tiles_pil) != self.num_tiles_total:
+                self._log_load_error('tiling_error', img_path_str, f"Extracted {len(tiles_pil)} tiles != expected {self.num_tiles_total}")
+                return self._dummy_image_tiles.clone()
+
+            # Apply Augmentation (if enabled) and Transforms to each tile
+            transformed_tiles_list = []
+            for tile_pil in tiles_pil:
+                if self.augmentation_transform:
+                    tile_aug = self.augmentation_transform(tile_pil)
+                    transformed_tile = self.tile_transform(tile_aug)
+                else:
+                    transformed_tile = self.tile_transform(tile_pil)
+                transformed_tiles_list.append(transformed_tile)
+
+            del tiles_pil # Free list of PIL tiles
+
+            # Stack list of tensors into one: (NumTiles, C, TileH, TileW)
+            transformed_tiles = torch.stack(transformed_tiles_list)
+
+            # Final shape check
+            if transformed_tiles.shape != (self.num_tiles_total, 3, self.tile_h, self.tile_w):
+                self._log_load_error('tiling_error', img_path_str, f"Final tensor shape mismatch! Got {transformed_tiles.shape}")
+                return self._dummy_image_tiles.clone()
+
+            return transformed_tiles
+
+        except FileNotFoundError:
+             self._log_load_error('not_found', img_path_str)
+             return self._dummy_image_tiles.clone()
+        except UnidentifiedImageError:
+             self._log_load_error('unidentified', img_path_str, "Corrupt/unsupported.")
+             return self._dummy_image_tiles.clone()
+        except Exception as img_err:
+             self._log_load_error('other', img_path_str, f"{type(img_err).__name__}")
+             # traceback.print_exc(limit=1) # Optional: uncomment for debug
+             return self._dummy_image_tiles.clone()
+        finally:
+            # Ensure image file handle is closed if error occurred mid-processing
+            if img is not None:
+                 try: img.close()
+                 except Exception: pass
+
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        """
+        Retrieves a sequence item: (ImageSequenceTensor, Target(s), WeightTensor)
+        ImageSequenceTensor: (SeqLen, NumTiles, C, H, W)
+        Target(s):
+            Keyboard: (VocabSize,) - Multi-hot float32 tensor
+            Mouse: ((ActionVocabSize,), (2,)) - Tuple of (Action one-hot, Position norm [x,y]) float32 tensors
+        WeightTensor: Scalar float32 tensor
+
+        Returns dummy data with correct shapes/types on any critical error.
+        """
+        # --- Validate Index and Dataset State ---
+        if not self.valid_indices_in_aligned or idx < 0 or idx >= len(self.valid_indices_in_aligned):
+            # Return clones of dummy data
+            return self._return_dummy()
+        if self.num_tiles_total <= 0 or self._dummy_image_seq.numel() == 0:
+            # Return clones if tiling failed or dummy creation failed
+            return self._return_dummy()
+
+        aligned_item_index = -1
+        target_frame_list_pos = -1
+
+        try:
+            # 1. Get the aligned data item dict for the *end* of the sequence
+            aligned_item_index = self.valid_indices_in_aligned[idx]
+            item = self.aligned_items[aligned_item_index]
+            target_frame_list_pos = item.get('list_pos')
+
+            if not isinstance(target_frame_list_pos, int):
+                 print(f"CRITICAL ERROR: Invalid 'list_pos' ({target_frame_list_pos}) in aligned item index {idx}. Returning dummy.")
+                 return self._return_dummy()
+
+            # 2. Load the sequence of tiled images
+            image_sequence_tiled: List[Optional[torch.Tensor]] = [] # Holds (NumTiles, C, H, W) tensors, could be None if load fails
+            load_errors_in_seq = 0
+
+            for i in range(self.sequence_length):
+                 current_frame_list_pos = target_frame_list_pos - (self.sequence_length - 1 - i)
+                 lookup_result = self.screenshot_lookup_by_listpos.get(current_frame_list_pos)
+                 img_tiles_tensor: Optional[torch.Tensor] = None
+
+                 if lookup_result:
+                     _, path_at_pos = lookup_result
+                     img_tiles_tensor = self._load_and_tile_image(path_at_pos)
+                 else:
+                     # Should not happen if valid_indices_in_aligned logic is correct
+                     img_path_for_log = f"Expected path for list_pos {current_frame_list_pos}"
+                     self._log_load_error('not_found', img_path_for_log, f"Lookup fail for frame needed by seq end {target_frame_list_pos}")
+                     # Fallback to using dummy tiles directly if load fails lookup
+                     img_tiles_tensor = self._dummy_image_tiles.clone()
+
+                 # Handle critical load fail (None returned) or load error (dummy returned)
+                 if img_tiles_tensor is None: # Critical fail
+                      load_errors_in_seq += 1
+                      img_tiles_tensor = self._dummy_image_tiles.clone() # Use dummy
+                 # Check if the returned tensor IS the dummy tensor (by identity or content if needed)
+                 elif torch.equal(img_tiles_tensor, self._dummy_image_tiles): # If dummy was returned
+                      load_errors_in_seq += 1
+                      # No need to clone again, it's already a clone
+
+                 image_sequence_tiled.append(img_tiles_tensor)
+
+            # Decide if too many load errors invalidate the whole sequence
+            # Allow some errors (e.g. 1 out of 8) but fail if >= 50% bad
+            if load_errors_in_seq > 0 and self.sequence_length > 0:
+                 error_rate = load_errors_in_seq / self.sequence_length
+                 if error_rate >= 0.5:
+                     # Log this type of failure periodically
+                     self._log_load_error('other', f"SeqEnd {target_frame_list_pos}", f"High frame error rate ({load_errors_in_seq}/{self.sequence_length}). Returning dummy sequence.")
+                     return self._return_dummy()
+
+            # Stack the list of tensors (should all be valid or dummy by now)
+            # If stacking fails, it indicates a shape mismatch despite logic, return dummy.
+            try:
+                # Ensure all items are tensors before stacking
+                image_sequence_tiled_tensors = [t for t in image_sequence_tiled if isinstance(t, torch.Tensor)]
+                if len(image_sequence_tiled_tensors) != self.sequence_length:
+                     raise ValueError("Mismatch between sequence length and number of valid tensors.")
+                # Stack along new dim 0 -> (Seq, NumTiles, C, H, W)
+                image_sequence_tensor = torch.stack(image_sequence_tiled_tensors, dim=0)
+
+                # Verify final shape
+                expected_seq_shape = (self.sequence_length, self.num_tiles_total, 3, self.tile_h, self.tile_w)
+                if image_sequence_tensor.shape != expected_seq_shape:
+                    print(f"ERROR: Final img sequence tensor shape mismatch {image_sequence_tensor.shape} vs {expected_seq_shape}. Item {idx}, Type: {self.target_type}. Returning dummy.")
+                    return self._return_dummy()
+            except (RuntimeError, ValueError) as stack_err:
+                print(f"ERROR stacking sequence tensors: {stack_err}. Item {idx}, Type: {self.target_type}. Shapes: {[t.shape if isinstance(t, torch.Tensor) else 'None' for t in image_sequence_tiled]}. Returning dummy.")
+                return self._return_dummy()
+
+            # 3. Get Reward Weight
+            try:
+                weight_val = item.get('reward_weight', 1.0)
+                weight = torch.tensor(float(weight_val) if isinstance(weight_val, (int, float)) and math.isfinite(weight_val) else 1.0, dtype=torch.float32)
+            except (ValueError, TypeError): weight = self._dummy_weight.clone()
+
+
+            # 4. Get Target(s) based on target_type
+            if self.target_type == 'keyboard':
+                if self.key_vocab_size == 0: return image_sequence_tensor, self._dummy_kb_target.clone(), weight
+                # Multi-hot vector for KB
+                kb_target = torch.zeros(self.key_vocab_size, dtype=torch.float32)
+                kb_indices = item.get('kb_actions', [])
+                if kb_indices:
+                     try: # Validate indices
+                         valid_indices = [int(i) for i in kb_indices if isinstance(i, (int, np.integer)) and 0 <= int(i) < self.key_vocab_size]
+                         if valid_indices: kb_target[valid_indices] = 1.0
+                     except (ValueError, TypeError, IndexError): pass # Ignore errors, keep target as zeros
+                return image_sequence_tensor, kb_target, weight
+
+            elif self.target_type == 'mouse':
+                 if self.mouse_action_vocab_size <= 1: # Only 'no_action'
+                     return image_sequence_tensor, (self._dummy_mouse_target_action.clone(), self._dummy_mouse_target_pos.clone()), weight
+                 # Action Target (One-hot)
+                 action_idx_raw = item.get('mouse_action', self.no_action_idx)
+                 try:
+                     valid_action_idx = int(action_idx_raw) if isinstance(action_idx_raw, (int, np.integer)) and 0 <= int(action_idx_raw) < self.mouse_action_vocab_size else self.no_action_idx
+                     action_target = F.one_hot(torch.tensor(valid_action_idx), num_classes=self.mouse_action_vocab_size).float()
+                 except (ValueError, TypeError, IndexError): action_target = self._dummy_mouse_target_action.clone()
+                 # Position Target (Normalized [x, y])
+                 raw_pos = item.get('mouse_pos', [0.5, 0.5])
+                 pos_target = self._dummy_mouse_target_pos.clone() # Default
+                 if isinstance(raw_pos, (list, np.ndarray, tuple)) and len(raw_pos) == 2:
+                      try:
+                          # Ensure floats, finite, clamp to [0, 1]
+                          x_raw, y_raw = map(float, raw_pos)
+                          if math.isfinite(x_raw) and math.isfinite(y_raw):
+                              x = max(0.0, min(1.0, x_raw))
+                              y = max(0.0, min(1.0, y_raw))
+                              pos_target = torch.tensor([x, y], dtype=torch.float32)
+                      except (ValueError, TypeError): pass # Ignore conversion errors, use default
+                 return image_sequence_tensor, (action_target, pos_target), weight
+            else: # Should not happen
+                 print(f"CRITICAL ERROR: Invalid target_type '{self.target_type}'.")
+                 return self._return_dummy()
+
+        except Exception as e:
+            print(f"CRITICAL ERROR in Dataset __getitem__: idx={idx}, Type={self.target_type}, AlignedIdx={aligned_item_index}. Error: {type(e).__name__} - {e}")
+            traceback.print_exc(limit=2)
+            return self._return_dummy()
+
+    def _return_dummy(self) -> Tuple[torch.Tensor, Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        """Returns cloned dummy data for error cases."""
+        img_seq = self._dummy_image_seq.clone()
+        weight = self._dummy_weight.clone()
+        if self.target_type == 'keyboard':
+            target = self._dummy_kb_target.clone()
+            return img_seq, target, weight
+        elif self.target_type == 'mouse':
+            target_act = self._dummy_mouse_target_action.clone()
+            target_pos = self._dummy_mouse_target_pos.clone()
+            return img_seq, (target_act, target_pos), weight
+        else: # Fallback
+            return img_seq, torch.empty(0), weight
+
+    def report_load_errors(self):
+        """Prints a summary of image load/process errors."""
+        total_errors = sum(self._load_error_counts.values())
+        if total_errors > 0:
+            print(f"\n--- Dataset '{self.target_type}' Image Load Error Summary ---")
+            for error_type, count in self._load_error_counts.items():
+                if count > 0: print(f"  {error_type.capitalize():<20}: {count}")
+            print(f"  {'Total Errors':<20}: {total_errors}")
+            print("-" * 48)
+        else:
+             print(f"\nDataset '{self.target_type}': No image load/process errors reported.")
+
+
+# --- Model Architecture ---
+class PositionalEncoding(nn.Module):
+    """Injects positional information into sequence embeddings."""
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1) # (max_len, 1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)) # (d_model/2)
+        pe = torch.zeros(1, max_len, d_model) # (1, max_len, d_model) for batch broadcasting
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        # Handle odd d_model dimension if necessary
+        if d_model % 2 != 0:
+            pe[0, :, 1::2] = torch.cos(position * div_term[:d_model // 2])
+        else:
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """ Adds positional encoding. x: (Batch, Seq, Dim) """
+        if x.shape[1] > self.pe.shape[1]:
+            raise ValueError(f"Seq length {x.shape[1]} > PosEnc max_len {self.pe.shape[1]}")
+        if x.shape[2] != self.pe.shape[2]:
+            raise ValueError(f"Input dim {x.shape[2]} != PosEnc d_model {self.pe.shape[2]}")
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+class VisionSequenceModel(nn.Module):
+    """
+    Combines ViT backbone (processing tiled images) with Temporal Transformer.
+    Outputs predictions for keyboard and/or mouse actions+position.
+    """
+    def __init__(self, vision_model_name: str,
+                 pretrained_model_path: Path,
+                 tile_size: Tuple[int, int], # H, W
+                 num_tiles_total: int,
+                 sequence_length: int,
+                 transformer_d_model: int,
+                 transformer_nhead: int,
+                 transformer_num_layers: int,
+                 transformer_dim_feedforward: int,
+                 transformer_dropout: float = 0.1,
+                 num_keyboard_classes: int = 0, # If > 0, enables keyboard head
+                 num_mouse_actions: int = 0,    # If > 0, enables mouse heads
+                 freeze_vision: bool = False):
+        super().__init__()
+        self.sequence_length = sequence_length
+        self.tile_h, self.tile_w = tile_size
+        self.num_tiles_total = num_tiles_total
+        self.transformer_d_model = transformer_d_model
+        self.vision_model_name_used = vision_model_name
+        self.num_keyboard_classes = num_keyboard_classes
+        self.num_mouse_actions = num_mouse_actions
+        self.freeze_vision = freeze_vision
+        self.vision_feature_dim = 0 # Set after loading ViT
+
+        if num_tiles_total <= 0: raise ValueError("num_tiles_total must be positive.")
+        print(f"\nInitializing VisionSequenceModel:")
+        print(f"  Vision Backbone: {vision_model_name} (Freeze: {freeze_vision})")
+        print(f"  Input: Seq={sequence_length}, Tiles={num_tiles_total} ({tile_size[0]}x{tile_size[1]})")
+        print(f"  Temporal Transformer: L={transformer_num_layers}, H={transformer_nhead}, D={transformer_d_model}")
+        print(f"  Outputs: KB Classes={num_keyboard_classes}, Mouse Actions={num_mouse_actions}")
+
+        # --- Load Pretrained Vision Backbone (ViT) ---
+        model_weights_path_safe = pretrained_model_path / "model.safetensors"
+        model_weights_path_bin = pretrained_model_path / "pytorch_model.bin"
+        weights_path_to_use = None; load_safe = False
+
+        if model_weights_path_safe.is_file() and SAFETENSORS_AVAILABLE:
+            weights_path_to_use = model_weights_path_safe; load_safe = True
+            print(f"  Using preferred weights: {weights_path_to_use.name}")
+        elif model_weights_path_bin.is_file():
+            weights_path_to_use = model_weights_path_bin
+            print(f"  Using fallback weights: {weights_path_to_use.name}")
+        else:
+            raise FileNotFoundError(f"CRITICAL: Neither 'model.safetensors' nor 'pytorch_model.bin' found in {pretrained_model_path}")
+
+        try:
+            print(f"  Creating vision backbone '{vision_model_name}' structure (pretrained=False)...")
+            # Create ViT structure. num_classes=0 removes head, global_pool='avg' gives feature vector.
+            self.vision_backbone = timm.create_model(
+                vision_model_name, pretrained=False, num_classes=0, global_pool='avg'
+            )
+            self.vision_feature_dim = self.vision_backbone.num_features
+            if self.vision_feature_dim <= 0: raise ValueError("ViT reported non-positive feature dimension")
+            print(f"  Vision backbone structure created. Feature Dim: {self.vision_feature_dim}")
+
+            # Load weights from local file
+            print(f"  Loading local weights from: {weights_path_to_use.name}...")
+            if load_safe: state_dict = load_safetensors_file(weights_path_to_use, device='cpu')
+            else: # Load .bin (potentially unsafe)
+                try: state_dict = torch.load(weights_path_to_use, map_location='cpu', weights_only=True)
+                except RuntimeError as e_wo: # Fallback if weights_only fails (common with older saves)
+                     print(f"    Warn: weights_only=True failed ({e_wo}). Trying weights_only=False (less secure).")
+                     try: state_dict = torch.load(weights_path_to_use, map_location='cpu', weights_only=False)
+                     except pickle.UnpicklingError as e_p: raise RuntimeError(f"UnpicklingError loading {weights_path_to_use.name}") from e_p
+                     except Exception as e_load: raise RuntimeError(f"Error loading {weights_path_to_use.name}") from e_load
+                except pickle.UnpicklingError as e_p: raise RuntimeError(f"UnpicklingError loading {weights_path_to_use.name}") from e_p
+                except Exception as e_load: raise RuntimeError(f"Error loading {weights_path_to_use.name}") from e_load
+
+            # Clean state dict (handle wrappers/prefixes)
+            if isinstance(state_dict, dict):
+                processed_sd = state_dict
+                # Common wrapper keys
+                for key in ['state_dict', 'model', 'module']:
+                    if key in processed_sd and isinstance(processed_sd[key], dict):
+                         processed_sd = processed_sd[key]; print(f"    Using weights inside wrapper key '{key}'."); break
+                # Common prefixes
+                cleaned_sd = {} ; prefix_removed = False
+                for k, v in processed_sd.items():
+                    orig_k = k
+                    for prefix in ['module.', 'backbone.', '_orig_mod.']:
+                        if k.startswith(prefix): k = k[len(prefix):]; prefix_removed = True; break
+                    cleaned_sd[k] = v
+                if prefix_removed: print("    Removed common prefixes from state dict keys.")
+                state_dict = cleaned_sd
+
+            # Load into model (strict=False ignores head layers etc not in our structure)
+            print("  Loading state dict into model (strict=False)...")
+            load_result = self.vision_backbone.load_state_dict(state_dict, strict=False)
+            expected_missing = ('head.', 'fc_norm.', 'norm.', 'pre_logits.')
+            unexpected_missing = [k for k in load_result.missing_keys if not k.startswith(expected_missing)]
+            if unexpected_missing: print(f"    Warn: UNEXPECTED Missing Keys in backbone state_dict: {unexpected_missing}")
+            if load_result.unexpected_keys: print(f"    Warn: UNEXPECTED Extra Keys found in checkpoint file: {load_result.unexpected_keys}")
+            print(f"  Successfully loaded weights into '{vision_model_name}'.")
+            del state_dict, processed_sd, cleaned_sd; cleanup_memory()
+
+        except (FileNotFoundError, RuntimeError, ValueError) as e: print(f"ERROR setting up vision backbone: {e}"); raise
+        except Exception as e_load: print(f"ERROR creating/loading vision backbone '{vision_model_name}': {e_load}"); traceback.print_exc(); raise
+
+        # --- Freeze Backbone (Optional) ---
+        if self.freeze_vision:
+            print("  Freezing vision backbone weights.")
+            for param in self.vision_backbone.parameters(): param.requires_grad = False
+            self.vision_backbone.eval() # Set to eval mode if frozen
+
+        # --- Input Projection (if needed) ---
+        if self.vision_feature_dim != self.transformer_d_model:
+            self.input_proj = nn.Linear(self.vision_feature_dim, self.transformer_d_model)
+            print(f"  Added Input Projection: {self.vision_feature_dim} -> {self.transformer_d_model}")
+        else:
+            self.input_proj = nn.Identity(); print("  ViT feature dim matches d_model. Using Identity.")
+
+        # --- Positional Encoding for Sequence ---
+        pe_max_len = max(256, sequence_length * 2) # Generous max length
+        self.pos_encoder = PositionalEncoding(self.transformer_d_model, max_len=pe_max_len, dropout=transformer_dropout)
+        print(f"  Initialized Positional Encoding (d_model={self.transformer_d_model}, max_len={self.pos_encoder.pe.shape[1]})")
+
+        # --- Temporal Transformer Encoder ---
+        try:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self.transformer_d_model, nhead=transformer_nhead,
+                dim_feedforward=transformer_dim_feedforward, dropout=transformer_dropout,
+                activation="gelu", batch_first=True, norm_first=True # NormFirst generally preferred
+            )
+            encoder_norm = nn.LayerNorm(self.transformer_d_model) # Optional final norm
+            self.transformer_encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers=transformer_num_layers, norm=encoder_norm
+            )
+            print(f"  Initialized Temporal Transformer: L={transformer_num_layers}, H={transformer_nhead}, DFF={transformer_dim_feedforward}")
+        except Exception as e_tr: raise RuntimeError("Failed to initialize Temporal Transformer") from e_tr
+
+        # --- Output Heads ---
+        self.keyboard_head, self.mouse_action_head, self.mouse_pos_head = None, None, None
+        if num_keyboard_classes > 0:
+             try: # Linear head for multi-label keyboard classification (outputs logits)
+                 self.keyboard_head = nn.Linear(self.transformer_d_model, num_keyboard_classes)
+                 print(f"  Initialized Keyboard Head (Output logits: {num_keyboard_classes})")
+             except Exception as e_h: raise RuntimeError("Failed to initialize Keyboard Head") from e_h
+        if num_mouse_actions > 0:
+             try: # Linear head for mouse action classification (outputs logits)
+                 self.mouse_action_head = nn.Linear(self.transformer_d_model, num_mouse_actions)
+                 print(f"  Initialized Mouse Action Head (Output logits: {num_mouse_actions})")
+                 # MLP head for mouse position regression (output normalized [0,1])
+                 pos_hidden = max(32, self.transformer_d_model // 8)
+                 self.mouse_pos_head = nn.Sequential(
+                     nn.Linear(self.transformer_d_model, pos_hidden), nn.GELU(),
+                     nn.Dropout(0.1),
+                     nn.Linear(pos_hidden, 2), nn.Sigmoid() # Sigmoid ensures [0, 1]
+                 )
+                 print(f"  Initialized Mouse Position Head (Output: 2, Hidden: {pos_hidden}, Activation: Sigmoid)")
+             except Exception as e_h: raise RuntimeError("Failed to initialize Mouse Heads") from e_h
+        print("VisionSequenceModel initialization complete.")
+
+    def forward(self, x_seq_tiled: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Forward pass. Input: (B, S, T, C, TileH, TileW)
+        Returns Tuple: (kb_logits, mouse_act_logits, mouse_pos_pred) - None if head disabled.
+        Output Shapes: (B, NumKBClass), (B, NumMouseAct), (B, 2)
+        """
+        # --- Input Shape Validation ---
+        if x_seq_tiled.ndim != 6: raise ValueError(f"Input tensor shape err: Expected 6 dims, got {x_seq_tiled.ndim}")
+        B, S, T, C, H, W = x_seq_tiled.shape
+        if S != self.sequence_length or T != self.num_tiles_total or H != self.tile_h or W != self.tile_w:
+             raise ValueError(f"Input dims mismatch: Got SxTxHxW={S}x{T}x{H}x{W}. Expected {self.sequence_length}x{self.num_tiles_total}x{self.tile_h}x{self.tile_w}")
+
+        # --- Process Tiles through Vision Backbone ---
+        # Reshape: (B, S, T, C, H, W) -> (B*S*T, C, H, W) to process all tiles at once
+        x_flat_tiles = x_seq_tiled.view(B * S * T, C, H, W)
+        vision_features_flat = None # (B*S*T, vision_feature_dim)
+
+        try:
+            grad_context = torch.no_grad() if self.freeze_vision else torch.enable_grad()
+            amp_context = autocast(device_type=x_flat_tiles.device.type, enabled=torch.is_autocast_enabled())
+            with grad_context, amp_context:
+                 # Set backbone to eval if frozen, respecting outer train/eval otherwise
+                 original_bb_mode = self.vision_backbone.training
+                 if self.freeze_vision: self.vision_backbone.eval()
+                 # Feature extraction
+                 vision_features_flat = self.vision_backbone(x_flat_tiles)
+                 # Restore mode if changed
+                 if self.freeze_vision: self.vision_backbone.train(original_bb_mode)
+        except Exception as e_vit_fwd: print(f"ERROR during ViT forward: {e_vit_fwd}"); traceback.print_exc(limit=1); raise
+
+        # --- Combine Tile Features ---
+        # Reshape back: (B*S*T, D_vit) -> (B, S, T, D_vit)
+        try: vision_features_tiled = vision_features_flat.view(B, S, T, self.vision_feature_dim)
+        except RuntimeError as e_reshape: print(f"ERROR reshaping ViT feats: flat={vision_features_flat.shape} Target=(B,S,T,D)={B},{S},{T},{self.vision_feature_dim}. Err: {e_reshape}"); raise
+
+        # Combine tiles for each frame, e.g., using mean pooling: (B, S, T, D_vit) -> (B, S, D_vit)
+        # Can experiment with max pooling or attention over tiles if needed
+        vision_features_seq = vision_features_tiled.mean(dim=2)
+
+        # --- Process Sequence through Temporal Transformer ---
+        final_features = None # (B, transformer_d_model) - features of the LAST time step
+        try:
+            # Project features if needed: (B, S, D_vit) -> (B, S, D_model)
+            transformer_input = self.input_proj(vision_features_seq)
+            # Add positional encoding: (B, S, D_model) -> (B, S, D_model)
+            transformer_input_pe = self.pos_encoder(transformer_input)
+            # Pass through temporal encoder (batch_first=True): (B, S, D_model) -> (B, S, D_model)
+            with autocast(device_type=transformer_input_pe.device.type, enabled=torch.is_autocast_enabled()):
+                 memory = self.transformer_encoder(transformer_input_pe)
+            # Get features of the LAST time step for prediction
+            if memory is not None and memory.ndim == 3: final_features = memory[:, -1, :]
+            else: raise ValueError(f"Transformer output shape err: {memory.shape if memory is not None else 'None'}")
+        except Exception as e_tr_fwd: print(f"ERROR during Temporal Transformer forward: {e_tr_fwd}"); traceback.print_exc(limit=1); raise
+
+        # --- Generate Outputs from Heads ---
+        kb_logits, mouse_act_logits, mouse_pos_pred = None, None, None
+        if final_features is None: raise ValueError("final_features is None before output heads.")
+        try:
+            with autocast(device_type=final_features.device.type, enabled=torch.is_autocast_enabled()):
+                if self.keyboard_head: kb_logits = self.keyboard_head(final_features)
+                if self.mouse_action_head: mouse_act_logits = self.mouse_action_head(final_features)
+                if self.mouse_pos_head: mouse_pos_pred = self.mouse_pos_head(final_features)
+        except Exception as e_head_fwd: print(f"ERROR during Output Head forward: {e_head_fwd}"); traceback.print_exc(limit=1); raise
+
+        return kb_logits, mouse_act_logits, mouse_pos_pred
+
+# Named tuple for structured training result
+class TrainResult(NamedTuple):
+    final_model: Optional[nn.Module] # Model object (on device) - likely None to save memory
+    epochs_run: int
+    final_batch_size: int # Batch size used (initial, no dynamic adjustment implemented)
+    best_model_state_cpu: Optional[Dict[str, torch.Tensor]] # Best state dict on CPU, or None
+    saved_best_state_flag: bool # Whether best state was captured by validation improvement
+    stop_reason: str
+
+# --- Training Function ---
+def train_model(model: nn.Module, model_name: str,
+                train_loader: Optional[DataLoader], val_loader: Optional[DataLoader],
+                optimizer: optim.Optimizer, scheduler: Optional[ReduceLROnPlateau],
+                keyboard_criterion: Optional[nn.Module] = None,
+                mouse_action_criterion: Optional[nn.Module] = None,
+                mouse_pos_criterion: Optional[nn.Module] = None,
+                device: torch.device = torch.device('cpu'),
+                batch_size_start: int = 16,
+                time_limit_sec: Optional[int] = None,
+                mouse_pos_weight: float = MOUSE_POS_LOSS_WEIGHT
+                ) -> TrainResult:
+    """ Trains model with AMP, gradient clipping, early stopping, robust error handling. """
+    print(f"\n--- Starting Training: {model_name} ---")
+    time_limit_str = str(timedelta(seconds=time_limit_sec)) if time_limit_sec else "None"
+    print(f"  Device: {device}, Initial BS: {batch_size_start}, Time Limit: {time_limit_str}")
+    print(f"  Max Epochs: {EPOCHS_MAX}, Early Stop Patience: {PATIENCE_EARLY_STOPPING}")
+    train_batches = len(train_loader) if train_loader else 0
+    val_batches = len(val_loader) if val_loader else 0
+    print(f"  Train Batches: {train_batches}, Val Batches: {val_batches}")
+    print(f"  Optimizer: {type(optimizer).__name__}, LR Start: {optimizer.defaults.get('lr', 'N/A'):.1e}, WD: {optimizer.defaults.get('weight_decay', 'N/A')}")
+    print(f"  Grad Clip Norm: {GRADIENT_CLIP_VALUE}")
+    if model_name == 'Mouse AI': print(f"  Mouse Pos Loss Weight: {mouse_pos_weight}")
+
+    # --- Pre-Checks ---
+    if not train_loader or train_batches == 0:
+         reason = "Skipped - No training data (loader empty/None)"
+         print(f"ERROR: {reason}"); return TrainResult(None, 0, batch_size_start, None, False, reason)
+    if not model:
+         reason = "Skipped - Model is None"
+         print(f"ERROR: {reason}"); return TrainResult(None, 0, batch_size_start, None, False, reason)
+    if model_name == 'Keyboard AI' and keyboard_criterion is None:
+         reason = "Skipped - Missing Keyboard Criterion"
+         print(f"ERROR: {reason}"); return TrainResult(None, 0, batch_size_start, None, False, reason)
+    if model_name == 'Mouse AI' and (mouse_action_criterion is None or mouse_pos_criterion is None):
+         reason = "Skipped - Missing Mouse Criterion (action/pos)"
+         print(f"ERROR: {reason}"); return TrainResult(None, 0, batch_size_start, None, False, reason)
+
+    # --- Initialization ---
+    training_start_time = time.time()
+    model.to(device)
+    best_val_loss = float('inf'); epochs_no_improve = 0; actual_epochs_run = 0
+    training_stopped_reason = f"Reached max epochs ({EPOCHS_MAX})"
+    current_batch_size = batch_size_start # Static batch size in this implementation
+    best_model_state_cpu: Optional[Dict[str, torch.Tensor]] = None; saved_best_state_flag = False
+    use_amp = (device.type == 'cuda')
+    scaler = GradScaler(enabled=use_amp)
+    autocast_device_type = device.type
+    print(f"  AMP Enabled: {use_amp} (Scaler: {scaler.is_enabled()})")
+    if use_amp: cleanup_memory()
+
+    # --- Training Loop ---
+    try:
+        for epoch in range(EPOCHS_MAX):
+            epoch_start_time = time.time(); actual_epochs_run = epoch + 1
+            print(f"\n--- Epoch {actual_epochs_run}/{EPOCHS_MAX} ---")
+
+            # --- Training Phase ---
+            model.train()
+            if hasattr(model, 'freeze_vision') and model.freeze_vision: # Keep frozen backbone in eval
+                 if hasattr(model, 'vision_backbone'): model.vision_backbone.eval()
+
+            train_loss_accum = 0.0; samples_processed_train = 0
+            batches_skipped = {'nan_inf': 0, 'oom': 0, 'error': 0, 'dummy': 0}
+            oom_occurred_epoch = False # Flag for entire epoch
+
+            batch_iterator = iter(train_loader)
+            batch_idx = 0
+            while True: # Batch loop
+                 # Time Limit Check
+                 if time_limit_sec is not None and (time.time() - training_start_time > time_limit_sec):
+                     training_stopped_reason = "Time limit reached"
+                     print(f"\nINFO: {training_stopped_reason} during epoch {epoch + 1}.")
+                     # Return current state, ensuring model on CPU before finishing
+                     model.cpu(); cleanup_memory()
+                     return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+
+                 batch_data = None; batch_processed_ok = False; loss = torch.tensor(float('nan'))
+                 optimizer.zero_grad(set_to_none=True) # Clear gradients at batch start
+
+                 try:
+                     # --- Load and Validate Batch ---
+                     try: batch_data = next(batch_iterator); batch_idx += 1
+                     except StopIteration: break # End epoch
+                     except (OSError, ConnectionResetError, TimeoutError, BrokenPipeError, EOFError) as e_io:
+                         print(f"Warn: DataLoader I/O Error batch {batch_idx}: {type(e_io).__name__}. Skipping."); batches_skipped['error'] += 1; continue
+                     except Exception as e_load: print(f"Warn: DataLoader Error batch {batch_idx}: {e_load}. Skipping."); batches_skipped['error'] += 1; continue
+                     # Basic structure: img_seq, target(s), weights
+                     if not isinstance(batch_data, (list, tuple)) or len(batch_data) < 3: print(f"Warn: Invalid batch struct train batch {batch_idx}."); batches_skipped['error'] += 1; continue
+                     images_seq_tiled, weights = batch_data[0], batch_data[-1]
+                     if not isinstance(images_seq_tiled, torch.Tensor): print(f"Warn: Img not tensor train batch {batch_idx}."); batches_skipped['error'] += 1; continue
+                     # Check for dummy data from Dataset error
+                     if images_seq_tiled.numel() > 0 and torch.all(images_seq_tiled == 0):
+                         batches_skipped['dummy'] += 1
+                         if batches_skipped['dummy'] < 5 or batches_skipped['dummy'] % 100 == 0: print(f"Warn: Dummy img data train batch {batch_idx}. (Skipped: {batches_skipped['dummy']})");
+                         continue
+
+                     # Move to device
+                     images_seq_tiled = images_seq_tiled.to(device, non_blocking=PIN_MEMORY)
+                     weights = weights.to(device, non_blocking=PIN_MEMORY).float()
+                     current_bs_actual = images_seq_tiled.size(0)
+                     if current_bs_actual == 0: continue # Skip empty batch after filtering?
+
+                     # --- Validate Targets ---
+                     targets_kb, targets_mouse_act, targets_mouse_pos = None, None, None
+                     valid_targets = True
+                     try:
+                         if model_name == 'Keyboard AI':
+                             targets_kb = batch_data[1].to(device, non_blocking=PIN_MEMORY)
+                             exp_kb_cls = getattr(model, 'num_keyboard_classes', -1)
+                             if not (targets_kb.ndim == 2 and targets_kb.shape[0] == current_bs_actual and targets_kb.shape[1] == exp_kb_cls): valid_targets = False; print(f"Warn: Invalid KB target shape {targets_kb.shape}")
+                         elif model_name == 'Mouse AI':
+                             if not isinstance(batch_data[1], (list, tuple)) or len(batch_data[1]) != 2: valid_targets = False; print("Warn: Invalid Mouse target structure")
+                             else:
+                                 targets_mouse_act, targets_mouse_pos = batch_data[1][0].to(device, non_blocking=PIN_MEMORY), batch_data[1][1].to(device, non_blocking=PIN_MEMORY)
+                                 exp_mouse_cls = getattr(model, 'num_mouse_actions', -1)
+                                 if not (targets_mouse_act.ndim == 2 and targets_mouse_act.shape[0] == current_bs_actual and targets_mouse_act.shape[1] == exp_mouse_cls): valid_targets = False; print(f"Warn: Invalid Mouse Action shape {targets_mouse_act.shape}")
+                                 if not (targets_mouse_pos.ndim == 2 and targets_mouse_pos.shape == (current_bs_actual, 2)): valid_targets = False; print(f"Warn: Invalid Mouse Pos shape {targets_mouse_pos.shape}")
+                     except Exception as e_t: valid_targets = False; print(f"Warn: Error processing targets batch {batch_idx}: {e_t}")
+                     if not valid_targets: batches_skipped['error'] += 1; cleanup_memory(); continue
+
+                     # --- Forward Pass ---
+                     with autocast(device_type=autocast_device_type, enabled=use_amp):
+                         kb_logits, mouse_act_logits, mouse_pos_pred = model(images_seq_tiled)
+                         # --- Loss Calculation ---
+                         loss = torch.tensor(0.0, device=device); batch_loss_unweighted = torch.tensor(0.0, device=device)
+                         loss_ok = False
+                         try:
+                             if model_name == 'Keyboard AI' and keyboard_criterion and kb_logits is not None:
+                                 if kb_logits.shape == targets_kb.shape:
+                                     loss_kb_raw = keyboard_criterion(kb_logits, targets_kb.float()) # Need float target for BCE
+                                     if loss_kb_raw.ndim == 2: batch_loss_unweighted = loss_kb_raw.mean(dim=1); loss_ok=True # Avg over classes -> (B,)
+                                     else: print(f"Warn: KB loss shape unexpected: {loss_kb_raw.shape}")
+                                 else: print(f"Warn: KB logit/target shape mismatch: {kb_logits.shape} vs {targets_kb.shape}")
+                             elif model_name == 'Mouse AI':
+                                 loss_act = torch.tensor(0.0); loss_pos = torch.tensor(0.0)
+                                 act_ok, pos_ok = False, False
+                                 # Action Loss (BCE on one-hot treated as multi-label)
+                                 if mouse_action_criterion and mouse_act_logits is not None:
+                                     if mouse_act_logits.shape == targets_mouse_act.shape:
+                                         loss_act_raw = mouse_action_criterion(mouse_act_logits, targets_mouse_act.float()) # Target float
+                                         if loss_act_raw.ndim == 2: loss_act = loss_act_raw.mean(dim=1); act_ok = True # Avg over classes -> (B,)
+                                         else: print(f"Warn: Mouse Act loss shape: {loss_act_raw.shape}")
+                                     else: print(f"Warn: Mouse Act logit/target mismatch: {mouse_act_logits.shape} vs {targets_mouse_act.shape}")
+                                 # Position Loss (MSE)
+                                 if mouse_pos_criterion and mouse_pos_pred is not None:
+                                     if mouse_pos_pred.shape == targets_mouse_pos.shape:
+                                         loss_pos_raw = mouse_pos_criterion(mouse_pos_pred, targets_mouse_pos)
+                                         if loss_pos_raw.ndim == 2 and loss_pos_raw.shape[1]==2: loss_pos = loss_pos_raw.mean(dim=1); pos_ok = True # Avg over x,y -> (B,)
+                                         else: print(f"Warn: Mouse Pos loss shape: {loss_pos_raw.shape}")
+                                     else: print(f"Warn: Mouse Pos pred/target mismatch: {mouse_pos_pred.shape} vs {targets_mouse_pos.shape}")
+                                 # Combine
+                                 valid_mouse_losses = []
+                                 if act_ok and loss_act.shape == (current_bs_actual,): valid_mouse_losses.append(loss_act)
+                                 if pos_ok and loss_pos.shape == (current_bs_actual,): valid_mouse_losses.append(loss_pos * mouse_pos_weight)
+                                 if valid_mouse_losses:
+                                     batch_loss_unweighted = torch.stack(valid_mouse_losses).sum(dim=0); loss_ok = True
+                             # Apply reward weighting & get final batch loss (weighted mean)
+                             if loss_ok and batch_loss_unweighted.shape == weights.shape:
+                                 weight_sum = weights.sum().clamp(min=1e-6)
+                                 loss = (batch_loss_unweighted * weights).sum() / weight_sum
+                             elif loss_ok: loss = batch_loss_unweighted.mean(); print("Warn: Loss/weight shape mismatch, using unweighted mean.")
+                             else: loss = torch.tensor(float('nan'), device=device) # Ensure NaN if calc failed
+                         except Exception as e_loss: loss = torch.tensor(float('nan'), device=device); print(f"ERROR calculating loss batch {batch_idx}: {e_loss}")
+
+                     # --- Backward Pass & Step ---
+                     if not torch.isfinite(loss).all(): # Check loss before backward
+                         batches_skipped['nan_inf'] += 1;
+                         if batches_skipped['nan_inf'] % 100 == 0: print(f"Warn: NaN/Inf loss train batch {batch_idx}. Skipping step. (NaN skips: {batches_skipped['nan_inf']})")
+                         cleanup_memory(); continue # Skip batch
+
+                     # scaler.scale -> backward -> scaler.unscale_ -> clip -> scaler.step -> scaler.update
+                     try:
+                         scaler.scale(loss).backward()
+                         scaler.unscale_(optimizer) # Unscale before clip
+                         # Clip gradients
+                         params_with_grad = [p for p in model.parameters() if p.grad is not None]
+                         if params_with_grad:
+                             total_norm = torch.nn.utils.clip_grad_norm_(params_with_grad, GRADIENT_CLIP_VALUE)
+                             if not torch.isfinite(total_norm):
+                                  batches_skipped['nan_inf'] += 1
+                                  if batches_skipped['nan_inf'] % 100 == 0: print(f"Warn: NaN/Inf grad norm {total_norm:.2f} train batch {batch_idx}. Skipping step. (NaN skips: {batches_skipped['nan_inf']})")
+                                  cleanup_memory(); continue # Skip step if norm explodes
+                         scaler.step(optimizer) # Scaler automatically skips step if grads non-finite
+                         scaler.update()
+                         batch_processed_ok = True # Mark success if step completed
+                     except torch.cuda.OutOfMemoryError:
+                         print(f"\nERROR: OOM during backward/step! Batch {batch_idx} Size {current_bs_actual}. Skipping rest of epoch."); oom_occurred_epoch = True; batches_skipped['oom'] += 1
+                         cleanup_memory(); break # Break epoch loop
+                     except Exception as e_bw: print(f"ERROR during backward/step batch {batch_idx}: {e_bw}. Skipping."); batches_skipped['error'] += 1; cleanup_memory(); continue
+
+                 # --- Handle OOM outside main try-except for the batch ---
+                 except torch.cuda.OutOfMemoryError:
+                     print(f"\nERROR: OOM during training batch {batch_idx}! Size {current_bs_actual}. Skipping rest of epoch."); oom_occurred_epoch = True; batches_skipped['oom'] += 1
+                     cleanup_memory(); break # Break epoch loop
+                 # --- Handle any other unexpected errors for the batch ---
+                 except Exception as e_batch:
+                     print(f"ERROR Unexpected during train batch {batch_idx}: {type(e_batch).__name__} - {e_batch}"); traceback.print_exc(limit=1); batches_skipped['error'] += 1
+                     cleanup_memory(); continue # Skip batch
+                 # --- Batch Finalization / Cleanup ---
+                 finally:
+                      if batch_processed_ok and torch.isfinite(loss): # Only accumulate if batch successful
+                         train_loss_accum += loss.item() * current_bs_actual
+                         samples_processed_train += current_bs_actual
+                      # Manual deletion (helps sometimes)
+                      del loss, images_seq_tiled, weights, batch_data
+                      if 'kb_logits' in locals(): del kb_logits
+                      if 'mouse_act_logits' in locals(): del mouse_act_logits
+                      if 'mouse_pos_pred' in locals(): del mouse_pos_pred
+                      if 'targets_kb' in locals(): del targets_kb
+                      if 'targets_mouse_act' in locals(): del targets_mouse_act
+                      if 'targets_mouse_pos' in locals(): del targets_mouse_pos
+                      # More aggressive cleanup - possibly remove unless severe mem pressure
+                      # if batch_idx % 25 == 0: cleanup_memory()
+
+            # --- End of Training Epoch Loop ---
+            if oom_occurred_epoch: print(f"Epoch {actual_epochs_run} training interrupted by OOM.")
+            total_skipped = sum(batches_skipped.values())
+            if total_skipped > 0: print(f"Epoch {actual_epochs_run}: Skipped {total_skipped} train batches (NaN:{batches_skipped['nan_inf']}, OOM:{batches_skipped['oom']}, Err:{batches_skipped['error']}, Dum:{batches_skipped['dummy']})")
+
+            # --- Validation Phase ---
+            avg_train_loss = train_loss_accum / samples_processed_train if samples_processed_train > 0 else float('inf')
+            avg_val_loss = float('inf'); val_samples_processed = 0
+            oom_during_val = False; val_batches_skipped = {'error': 0, 'dummy': 0}
+            run_validation = (val_loader is not None and val_batches > 0 and not oom_occurred_epoch and samples_processed_train > 0)
+
+            if run_validation:
+                model.eval() # Set model to eval mode
+                val_loss_accum = 0.0
+                val_iterator = iter(val_loader); val_batch_idx = 0
+                while True: # Val batch loop
+                     if time_limit_sec is not None and (time.time() - training_start_time > time_limit_sec):
+                         training_stopped_reason = "Time limit reached"; print(f"\nINFO: {training_stopped_reason} during validation epoch {epoch + 1}.")
+                         model.cpu(); cleanup_memory()
+                         return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+
+                     batch_data_val = None; loss_val = torch.tensor(float('nan'))
+                     try:
+                         # --- Load and Validate Val Batch ---
+                         try: batch_data_val = next(val_iterator); val_batch_idx += 1
+                         except StopIteration: break # End val epoch
+                         except (OSError, ConnectionResetError, TimeoutError, BrokenPipeError, EOFError) as e_io_val:
+                              print(f"Warn: DataLoader I/O Error val batch {val_batch_idx}: {type(e_io_val).__name__}. Skipping."); val_batches_skipped['error'] += 1; continue
+                         except Exception as e_load_val: print(f"Warn: DataLoader Error val batch {val_batch_idx}: {e_load_val}. Skipping."); val_batches_skipped['error'] += 1; continue
+                         if not isinstance(batch_data_val, (list, tuple)) or len(batch_data_val) < 3: continue
+                         images_seq_tiled_val, _target_val, _weights_val = batch_data_val[0], batch_data_val[1], batch_data_val[2] # Need to get targets below
+                         if not isinstance(images_seq_tiled_val, torch.Tensor): continue
+                         # Check dummy
+                         if images_seq_tiled_val.numel() > 0 and torch.all(images_seq_tiled_val == 0):
+                             val_batches_skipped['dummy'] += 1
+                             if val_batches_skipped['dummy'] < 5 or val_batches_skipped['dummy'] % 100 == 0: print(f"Warn: Dummy img data val batch {val_batch_idx}. (Skipped: {val_batches_skipped['dummy']})")
+                             continue
+                         images_seq_tiled_val = images_seq_tiled_val.to(device, non_blocking=PIN_MEMORY)
+                         current_val_bs = images_seq_tiled_val.size(0)
+                         if current_val_bs == 0: continue
+
+                         # --- Val Forward Pass & Loss ---
+                         with torch.no_grad(), autocast(device_type=autocast_device_type, enabled=use_amp):
+                             kb_logits_val, mouse_act_logits_val, mouse_pos_pred_val = model(images_seq_tiled_val)
+                             # Loss calculation (mirrors training but without reward weights)
+                             loss_val = torch.tensor(0.0); batch_loss_unweighted_val = torch.tensor(0.0)
+                             loss_ok_val = False
+                             try:
+                                 if model_name == 'Keyboard AI' and keyboard_criterion and kb_logits_val is not None:
+                                     targets_kb_val = batch_data_val[1].to(device, non_blocking=PIN_MEMORY).float()
+                                     if kb_logits_val.shape == targets_kb_val.shape:
+                                         loss_kb_val_raw = keyboard_criterion(kb_logits_val, targets_kb_val)
+                                         if loss_kb_val_raw.ndim == 2: batch_loss_unweighted_val = loss_kb_val_raw.mean(dim=1); loss_ok_val = True
+                                 elif model_name == 'Mouse AI':
+                                     targets_mouse_act_val, targets_mouse_pos_val = batch_data_val[1][0].to(device, non_blocking=PIN_MEMORY).float(), batch_data_val[1][1].to(device, non_blocking=PIN_MEMORY)
+                                     loss_act_val, loss_pos_val = torch.tensor(0.0), torch.tensor(0.0)
+                                     act_ok_val, pos_ok_val = False, False
+                                     if mouse_action_criterion and mouse_act_logits_val is not None:
+                                         if mouse_act_logits_val.shape == targets_mouse_act_val.shape:
+                                             loss_act_val_raw = mouse_action_criterion(mouse_act_logits_val, targets_mouse_act_val)
+                                             if loss_act_val_raw.ndim == 2: loss_act_val = loss_act_val_raw.mean(dim=1); act_ok_val = True
+                                     if mouse_pos_criterion and mouse_pos_pred_val is not None:
+                                         if mouse_pos_pred_val.shape == targets_mouse_pos_val.shape:
+                                             loss_pos_val_raw = mouse_pos_criterion(mouse_pos_pred_val, targets_mouse_pos_val)
+                                             if loss_pos_val_raw.ndim == 2 and loss_pos_val_raw.shape[1]==2: loss_pos_val = loss_pos_val_raw.mean(dim=1); pos_ok_val = True
+                                     # Combine val mouse losses
+                                     valid_val_losses = []
+                                     if act_ok_val and loss_act_val.shape == (current_val_bs,): valid_val_losses.append(loss_act_val)
+                                     if pos_ok_val and loss_pos_val.shape == (current_val_bs,): valid_val_losses.append(loss_pos_val * mouse_pos_weight)
+                                     if valid_val_losses: batch_loss_unweighted_val = torch.stack(valid_val_losses).sum(dim=0); loss_ok_val = True
+                                 # Final mean val loss for batch
+                                 if loss_ok_val: loss_val = batch_loss_unweighted_val.mean()
+                                 else: loss_val = torch.tensor(float('nan'), device=device)
+                             except Exception as e_val_loss: loss_val = torch.tensor(float('nan'), device=device); print(f"Error calculating val loss batch {val_batch_idx}: {e_val_loss}")
+
+                         # Accumulate
+                         if torch.isfinite(loss_val):
+                              val_loss_accum += loss_val.item() * current_val_bs
+                              val_samples_processed += current_val_bs
+                         elif val_batch_idx % 100 == 0: # Log periodic NaN/Inf val loss
+                             print(f"Warn: NaN/Inf val loss detected batch {val_batch_idx}: {loss_val.item()}. Skipping acc.")
+
+                     # --- Handle Errors Val Batch ---
+                     except torch.cuda.OutOfMemoryError: print(f"\nERROR: OOM during validation batch {val_batch_idx}! Size {current_val_bs}. Stopping val epoch."); oom_during_val = True; cleanup_memory(); break # Stop val loop
+                     except Exception as e_batch_val: print(f"ERROR during val batch {val_batch_idx}: {e_batch_val}"); val_batches_skipped['error'] += 1; continue # Skip batch
+                     finally: del images_seq_tiled_val, loss_val, batch_data_val # etc.
+
+                # --- End of Validation Epoch ---
+                if oom_during_val: print(f"Epoch {actual_epochs_run}: Validation interrupted by OOM.")
+                total_skipped_val = sum(val_batches_skipped.values())
+                if total_skipped_val > 0: print(f"Epoch {actual_epochs_run}: Skipped {total_skipped_val} val batches (Err:{val_batches_skipped['error']}, Dum:{val_batches_skipped['dummy']})")
+
+                if val_samples_processed > 0:
+                    avg_val_loss = val_loss_accum / val_samples_processed
+                    val_loss_comp = avg_val_loss if math.isfinite(avg_val_loss) else float('inf')
+                    # LR Scheduler Step
+                    if scheduler:
+                        lr_before = optimizer.param_groups[0]['lr']
+                        scheduler.step(val_loss_comp) # Step scheduler based on finite val loss
+                        if optimizer.param_groups[0]['lr'] < lr_before: print(f"  LR Reduced by scheduler to {optimizer.param_groups[0]['lr']:.3e}")
+                    # Check Early Stopping & Save Best Model
+                    if val_loss_comp < best_val_loss:
+                         best_val_loss = val_loss_comp; epochs_no_improve = 0
+                         try: # Capture state dict on CPU immediately
+                             orig_device = next(model.parameters()).device
+                             model.cpu() # Temporarily move to CPU
+                             best_model_state_cpu = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
+                             model.to(orig_device) # Move back
+                             saved_best_state_flag = True
+                             print(f"  ** New best val loss: {best_val_loss:.4f}. Model state captured. **")
+                         except Exception as e_cap: saved_best_state_flag = False; best_model_state_cpu = None; print(f"Warn: Could not capture best state: {e_cap}")
+                    else: # No improvement
+                         epochs_no_improve += 1
+                         print(f"  Val loss ({val_loss_comp:.4f}) did not improve vs best ({best_val_loss:.4f}). Patience: {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
+                         if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
+                              training_stopped_reason = f"Early stopping (patience {PATIENCE_EARLY_STOPPING})"
+                              print(f"\n{training_stopped_reason} after {actual_epochs_run} epochs.")
+                              model.cpu(); cleanup_memory()
+                              return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+                else: # Validation ran but 0 samples processed
+                     print(f"  Warning: No validation samples processed successfully epoch {epoch+1}.")
+                     epochs_no_improve += 1 # Increment patience on failure
+                     print(f"  Patience count (validation failed): {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
+                     if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
+                         stop_msg = "val failed repeatedly" if best_val_loss != float('inf') else "val never succeeded"
+                         training_stopped_reason = f"Stopping ({stop_msg} after {PATIENCE_EARLY_STOPPING} attempts)"
+                         print(f"\nStopping after {actual_epochs_run} epochs ({training_stopped_reason}).")
+                         model.cpu(); cleanup_memory()
+                         return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+            else: # Validation skipped
+                print(f"Epoch {epoch+1}: Validation skipped.")
+                epochs_no_improve += 1 # Increment patience if val skipped
+                print(f"  Patience count (no validation): {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
+                if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
+                     training_stopped_reason = f"Early stopping (val skipped {PATIENCE_EARLY_STOPPING} times)"
+                     print(f"\n{training_stopped_reason} after {actual_epochs_run} epochs.")
+                     model.cpu(); cleanup_memory()
+                     return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+
+            # --- End of Epoch Summary Log ---
+            epoch_duration = time.time() - epoch_start_time; current_lr = optimizer.param_groups[0]['lr']
+            train_loss_str = f"{avg_train_loss:.4f}" if samples_processed_train > 0 and math.isfinite(avg_train_loss) else "N/A"
+            val_loss_str = "N/A"; oom_str = 'Yes' if oom_occurred_epoch or oom_during_val else 'No'
+            if run_validation:
+                 if val_samples_processed > 0: val_loss_str = f"{avg_val_loss:.4f}" if math.isfinite(avg_val_loss) else str(avg_val_loss)
+                 elif oom_during_val: val_loss_str = 'OOM'
+                 else: val_loss_str = 'Failed (0)'
+            else: val_loss_str = 'Skipped'
+            print(f"Epoch {epoch+1} Summary | Train Loss: {train_loss_str} | Val Loss: {val_loss_str} | LR: {current_lr:.3e} | Dur: {epoch_duration:.2f}s | OOM: {oom_str}")
+
+            # Final time limit check end of epoch
+            if time_limit_sec is not None and (time.time() - training_start_time > time_limit_sec):
+                 training_stopped_reason = "Time limit reached"; print(f"\nINFO: {training_stopped_reason} at end of epoch {epoch + 1}.")
+                 model.cpu(); cleanup_memory()
+                 return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+
+        # --- End of Training Loop (Max Epochs) ---
+        print(f"\nFinished training after reaching max {EPOCHS_MAX} epochs.")
+        model.cpu(); cleanup_memory() # Final model to CPU
+        return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+
+    # --- Global Exception Handler for train_model ---
+    except torch.cuda.OutOfMemoryError as e_oom:
+        training_stopped_reason = "OOM Error (train_model outer scope)"; print(f"\n--- CRITICAL OOM ERROR ({model_name} training): {e_oom} ---")
+        cleanup_memory() # Try to clean up
+        if 'model' in locals() and model is not None: model.cpu() # Try moving to CPU
+        return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+    except Exception as e_train:
+        training_stopped_reason = f"Crashed: {type(e_train).__name__}"; print(f"\n--- CRITICAL ERROR ({model_name} training): {e_train} ---"); traceback.print_exc()
+        cleanup_memory()
+        if 'model' in locals() and model is not None: model.cpu() # Try moving to CPU
+        return TrainResult(None, actual_epochs_run, current_batch_size, best_model_state_cpu, saved_best_state_flag, training_stopped_reason)
+    # No 'finally' needed here, the goal is to return the TrainResult
+
+
+# --- Model Saving Function ---
+def save_model_checkpoint(model_state_dict_cpu: Optional[Dict[str, torch.Tensor]],
+                          filename: Path, old_filename: Path, model_info: Dict[str, Any]) -> bool:
+    """
+    Saves model state_dict (on CPU) + metadata, backing up old file.
+    Includes checks to avoid saving poor/failed runs.
+    """
+    model_id_name = model_info.get('name', 'Unknown')
+    epochs_run = model_info.get('epochs', 0)
+    stop_reason = model_info.get('reason', 'Unknown')
+    saved_best_flag = model_info.get('saved_best_flag', False)
+
+    print(f"\nAttempting save: {model_id_name} (Reason: {stop_reason}, Epochs: {epochs_run}, Best State Captured: {saved_best_flag})")
+
+    # --- Decide Whether to Save ---
+    allow_save = True
+    failure_keywords = ["Crash", "Skipped", "Error", "OOM", "Insufficient", "failed", "Not run", "Dataset", "DataLoader", "Criterion", "Setup", "Preprocessing", "aligned", "Tiling", "None", "timeout", "pipe"]
+    reason_lower = stop_reason.lower()
+
+    if model_state_dict_cpu is None:
+        print("  Decision: Cannot save - Model state dict is None.")
+        allow_save = False
+    # Check if the stop reason indicates a critical failure/skip, AND no best state was captured
+    elif any(keyword.lower() in reason_lower for keyword in failure_keywords):
+        if not saved_best_flag: # If reason is failure AND no best state was saved during training
+             print(f"  Decision: Cannot save - Stop reason '{stop_reason}' indicates failure/skip, and no best val state was captured.")
+             allow_save = False
+        else: # Failure reason but we HAVE a best state (e.g. improved then crashed/timed out)
+             print(f"  Decision: Saving best captured state despite failure stop reason '{stop_reason}'.")
+
+    if not allow_save:
+        print(f"Skipping save operation for {model_id_name}.")
+        return False
+
+    print(f"  Proceeding with save to {filename.name}...")
+    # --- Backup Old Model ---
+    if filename.exists():
+        try:
+            old_filename.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic replace if possible (same filesystem)
+            os.replace(str(filename), str(old_filename))
+            print(f"  Backed up '{filename.name}' to '{old_filename.name}'.")
+        except OSError: # Often cross-device error
+             print(f"  Info: os.replace failed for backup (likely cross-device). Trying copy/delete...")
+             try:
+                 shutil.copy2(str(filename), str(old_filename))
+                 filename.unlink()
+                 print("  Backup successful via copy/delete.")
+             except Exception as e_cp:
+                 print(f"  ERROR: Backup copy/delete failed: {e_cp}. Overwriting without backup!")
+                 try:
+                     filename.unlink(missing_ok=True)
+                 except Exception as e_unlink_inner:
+                     print(f"    Failed to unlink original file before overwrite attempt: {e_unlink_inner}")
+                     pass # Still attempt overwrite
+        except Exception as e_bk:
+             print(f"  ERROR: Backup failed: {e_bk}. Overwriting!")
+             try:
+                 filename.unlink(missing_ok=True)
+             except Exception as e_unlink_outer:
+                 print(f"    Failed to unlink original file before overwrite attempt: {e_unlink_outer}")
+                 pass # Still attempt overwrite
+
+
+    # --- Save New Model ---
+    try:
+        # Verify state dict before saving
+        if not isinstance(model_state_dict_cpu, dict): raise TypeError("State is not dict")
+        for k, v in model_state_dict_cpu.items():
+            if not isinstance(v, torch.Tensor): raise TypeError(f"Item '{k}' is not Tensor")
+            if v.device.type != 'cpu': raise TypeError(f"CRITICAL: Tensor '{k}' not on CPU!")
+
+        # Metadata for reloading
+        save_dict = {
+            'state_dict': model_state_dict_cpu, 'model_name': model_id_name,
+            'epochs_run': epochs_run, 'batch_size_initial': model_info.get('batch_size'),
+            'stop_reason': stop_reason, 'saved_best_flag': saved_best_flag,
+            'timestamp': time.time(), 'pytorch_version': torch.__version__,
+            'timm_version': timm.__version__ if TIMM_AVAILABLE else None,
+            # Architecture params
+            'vision_model_name': model_info.get('vision_model_name'),
+            'sequence_length': model_info.get('sequence_length'),
+            'tile_size': model_info.get('tile_size'), # H, W
+            'num_tiles_m': model_info.get('num_tiles_m'), 'num_tiles_n': model_info.get('num_tiles_n'),
+            'num_tiles_total': model_info.get('num_tiles_total'),
+            'screen_resolution': model_info.get('screen_resolution'), # W, H
+            'transformer_d_model': model_info.get('transformer_d_model'),
+            'transformer_nhead': model_info.get('transformer_nhead'),
+            'transformer_num_layers': model_info.get('transformer_num_layers'),
+            'transformer_dim_feedforward': model_info.get('transformer_dim_feedforward'),
+            'transformer_dropout': model_info.get('transformer_dropout'),
+            # Data/Training params
+            'train_samples': model_info.get('train_samples', 0),
+            'val_samples': model_info.get('val_samples', 0),
+            'data_augmentation': model_info.get('data_augmentation', ADD_DATA_AUGMENTATION),
+        }
+        # Add model-specific vocab/class info
+        if model_id_name == 'Keyboard AI':
+            save_dict['key_to_idx'] = model_info.get('key_to_idx')
+            save_dict['idx_to_key'] = model_info.get('idx_to_key')
+            save_dict['num_classes'] = model_info.get('num_classes')
+        elif model_id_name == 'Mouse AI':
+            save_dict['mouse_action_to_idx'] = model_info.get('mouse_action_to_idx')
+            save_dict['num_action_classes'] = model_info.get('num_action_classes')
+            save_dict['mouse_pos_loss_weight'] = model_info.get('mouse_pos_loss_weight')
+
+        # Atomic save: save to temp file, then replace
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        temp_filename = filename.with_suffix(filename.suffix + '.tmp' + str(random.randint(1000,9999)))
+        torch.save(save_dict, temp_filename, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(str(temp_filename), str(filename))
+
+        print(f"Successfully saved '{model_id_name}' to: {filename.name}")
+        return True
+    except Exception as e_save:
+        print(f"ERROR saving model '{filename.name}': {e_save}"); traceback.print_exc(limit=1)
+        # Clean up temp file if it exists
+        if 'temp_filename' in locals() and temp_filename.exists():
+            try: temp_filename.unlink(); print(f"  Removed temp file '{temp_filename.name}'.")
+            except Exception as e_rem: print(f"  Warn: Failed removing temp file '{temp_filename.name}': {e_rem}")
+        return False
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+
+    # Set multiprocessing context if needed (before CUDA init potentially)
+    if platform.system() != "Windows" and NUM_DATALOADER_WORKERS > 0:
+         preferred_method = 'spawn' # Generally safer with CUDA
+         try:
+             # Avoid setting if already started, even if method differs. Checking first is safer.
+             if torch.multiprocessing.get_start_method(allow_none=True) is None:
+                 torch.multiprocessing.set_start_method(preferred_method, force=True)
+                 print(f"Set multiprocessing start method to '{preferred_method}'.")
+             else:
+                 print(f"Multiprocessing context already started. Using: '{torch.multiprocessing.get_start_method()}'.")
+         except Exception as e_mp: # Catches if started or other issues
+              print(f"Warn: Couldn't set MP start method to '{preferred_method}': {e_mp}. Using '{torch.multiprocessing.get_start_method()}'.")
+
+    # --- Print Header ---
+    print("\n" + "="*65)
+    print("    Starting Tiled Vision Transformer AI Model Training Script")
+    print("="*65)
+    print(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"PyTorch: {torch.__version__}, Platform: {platform.system()}, CPU Cores: {_cpu_count}")
+    if TIMM_AVAILABLE: print(f"Timm: {timm.__version__}, ViT: {VISION_MODEL_NAME}")
+    else: print("Timm: Not Available (ERROR)")
+    print(f"Architecture: ViT -> Tiled Input ({TILE_SIZE[0]}x{TILE_SIZE[1]}) -> Temporal Transformer")
+    print(f"  Transformer: L={TRANSFORMER_NUM_LAYERS}, H={TRANSFORMER_NHEAD}, D={TRANSFORMER_D_MODEL}, FFN={TRANSFORMER_DIM_FEEDFORWARD}")
+    print(f"Sequence Len: {SEQUENCE_LENGTH}, Init Batch: {BATCH_SIZE_INITIAL}, LR: {LEARNING_RATE:.1e}, WD: {WEIGHT_DECAY:.1e}")
+    time_limit_str_main = str(timedelta(seconds=TRAINING_TIME_LIMIT_PER_MODEL_SEC)) if TRAINING_TIME_LIMIT_PER_MODEL_SEC else "None"
+    print(f"Max Epochs: {EPOCHS_MAX}, Patience: {PATIENCE_EARLY_STOPPING}, Time Limit: {time_limit_str_main}, Workers: {NUM_DATALOADER_WORKERS}")
+    print(f"Min Valid Seqs Req: {MIN_VALID_SEQUENCES_FOR_TRAINING}")
+    print(f"Augmentation: {ADD_DATA_AUGMENTATION}, Mouse Pos Loss Weight: {MOUSE_POS_LOSS_WEIGHT}")
+    print(f"Forbidden KB Keys: {len(FORBIDDEN_KEYS)}, Target Mouse Actions: {MOUSE_ACTION_TYPES_TARGET}")
+    print("-"*65)
+    main_start_time = time.time()
+
+    # --- Initialization ---
+    keyboard_train_result: Optional[TrainResult] = None; mouse_train_result: Optional[TrainResult] = None
+    keyboard_train_loader: Optional[DataLoader] = None; keyboard_val_loader: Optional[DataLoader] = None
+    mouse_train_loader: Optional[DataLoader] = None; mouse_val_loader: Optional[DataLoader] = None
+    full_kb_dataset_obj: Optional[ActionDatasetSequence] = None; full_mouse_dataset_obj: Optional[ActionDatasetSequence] = None
+    key_to_idx: Dict = {}; idx_to_key: Dict = {}; mouse_action_to_idx: Dict = {}
+    num_keyboard_classes, num_mouse_action_classes = 0, 0
+    kb_train_seqs, kb_val_seqs = 0, 0; mouse_train_seqs, mouse_val_seqs = 0, 0
+    kb_saved_final, mouse_saved_final = False, False
+    preprocessing_info: Optional[PreprocessingOutput] = None
+    device: Optional[torch.device] = None
+    current_screen_resolution: Optional[Tuple[int, int]] = None # W, H
+    m_tiles, n_tiles, total_tiles = 0, 0, 0 # Set by preprocessing
+    main_error_occurred = False; error_msg_main = "" # Flag and message for critical main errors
+
+    # --- Main Try Block (covers setup, preprocessing, dataset/loader creation, training, saving) ---
+    try:
+        # --- Device Setup ---
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print(f"Using GPU: {torch.cuda.get_device_name(0)} (Mem: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB)")
+            cleanup_memory()
+        else:
+            device = torch.device("cpu"); print("Using CPU for training.")
+        print("-" * 30)
+
+        # --- Data Preprocessing ---
+        preprocessing_info = preprocess_data()
+
+        # --- Check Preprocessing Outcome ---
+        if not preprocessing_info or not preprocessing_info.success_flag:
+             main_error_occurred = True
+             error_msg_main = "Preprocessing Failed or Found No Valid Data"
+             print(f"ERROR: {error_msg_main}. Cannot proceed.")
+             # Populate default error results if not set later
+             if not keyboard_train_result: keyboard_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,error_msg_main)
+             if not mouse_train_result: mouse_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,error_msg_main)
+             # No need for else here, main finally block will handle summary
+
+        # --- Only proceed if preprocessing was successful and yielded data ---
+        elif preprocessing_info.df_aligned is not None and not preprocessing_info.df_aligned.empty and preprocessing_info.screen_resolution and NUM_TILES_TOTAL > 0:
+            df_aligned = preprocessing_info.df_aligned # This is needed for Datasets
+            screenshot_list_full = preprocessing_info.screenshot_list_full
+            key_to_idx = preprocessing_info.key_to_idx
+            idx_to_key = preprocessing_info.idx_to_key
+            mouse_action_to_idx = preprocessing_info.mouse_action_to_idx
+            current_screen_resolution = preprocessing_info.screen_resolution # W, H
+            m_tiles, n_tiles, total_tiles = NUM_TILES_M, NUM_TILES_N, NUM_TILES_TOTAL # Use globals set by calc_tiling
+
+            num_total_aligned = len(df_aligned)
+            num_keyboard_classes = len(key_to_idx)
+            num_mouse_action_classes = len(mouse_action_to_idx)
+            print("-" * 30); print("Preprocessing Succeeded:")
+            print(f"  Aligned Samples (Action Followed Screenshot): {num_total_aligned}")
+            print(f"  KB Vocab Size: {num_keyboard_classes}, Mouse Action Vocab Size: {num_mouse_action_classes} ({list(mouse_action_to_idx.keys())})")
+            print(f"  Screen Resolution: {current_screen_resolution}, Tiles: {m_tiles}x{n_tiles}={total_tiles}")
+            print("-" * 30)
+
+            print("Creating Datasets and DataLoaders...")
+            kb_dataset_ok, mouse_dataset_ok = False, False
+            kb_loader_ok, mouse_loader_ok = False, False
+            # Reasons for potential skipping (will be updated)
+            keyboard_skip_reason = "Dataset OK"
+            mouse_skip_reason = "Dataset OK"
+
+            # --- Keyboard Dataset ---
+            if num_keyboard_classes > 0:
+                try:
+                    print("  Init KB Dataset...")
+                    full_kb_dataset_obj = ActionDatasetSequence(
+                        df_aligned, screenshot_list_full, SEQUENCE_LENGTH, TILE_SIZE,
+                        current_screen_resolution, m_tiles, n_tiles, total_tiles,
+                        'keyboard', key_vocab_size=num_keyboard_classes, add_augmentation=ADD_DATA_AUGMENTATION )
+                    kb_total_sequences = len(full_kb_dataset_obj)
+                    print(f"  KB Dataset valid sequences found: {kb_total_sequences}")
+                    if kb_total_sequences >= MIN_VALID_SEQUENCES_FOR_TRAINING: kb_dataset_ok = True
+                    else: keyboard_skip_reason = f"Skipped - Insufficient KB sequences ({kb_total_sequences} < {MIN_VALID_SEQUENCES_FOR_TRAINING})"; print(f"  Warning: {keyboard_skip_reason}")
+                except Exception as e_ds: keyboard_skip_reason = f"KB Dataset Error: {type(e_ds).__name__}"; print(f"ERROR: {keyboard_skip_reason}"); traceback.print_exc(limit=1)
+            else: keyboard_skip_reason = "Skipped - No KB classes found"; print(f"  Info: {keyboard_skip_reason}")
+
+            # --- Mouse Dataset ---
+            if num_mouse_action_classes > 1: # Need more than just no_action
+                 try:
+                    print("  Init Mouse Dataset...")
+                    full_mouse_dataset_obj = ActionDatasetSequence(
+                         df_aligned, screenshot_list_full, SEQUENCE_LENGTH, TILE_SIZE,
+                         current_screen_resolution, m_tiles, n_tiles, total_tiles,
+                         'mouse', mouse_action_vocab_size=num_mouse_action_classes, mouse_action_to_idx=mouse_action_to_idx, add_augmentation=ADD_DATA_AUGMENTATION )
+                    mouse_total_sequences = len(full_mouse_dataset_obj)
+                    print(f"  Mouse Dataset valid sequences found: {mouse_total_sequences}")
+                    if mouse_total_sequences >= MIN_VALID_SEQUENCES_FOR_TRAINING: mouse_dataset_ok = True
+                    else: mouse_skip_reason = f"Skipped - Insufficient Mouse sequences ({mouse_total_sequences} < {MIN_VALID_SEQUENCES_FOR_TRAINING})"; print(f"  Warning: {mouse_skip_reason}")
+                 except Exception as e_ds: mouse_skip_reason = f"Mouse Dataset Error: {type(e_ds).__name__}"; print(f"ERROR: {mouse_skip_reason}"); traceback.print_exc(limit=1)
+            else: mouse_skip_reason = "Skipped - Only 'no_action' mouse class found"; print(f"  Info: {mouse_skip_reason}")
+
+            del df_aligned; cleanup_memory() # Free aligned df memory
+
+            # --- Create DataLoaders ---
+            loader_args = { # Common args
+                'batch_size': BATCH_SIZE_INITIAL, 'num_workers': NUM_DATALOADER_WORKERS,
+                'pin_memory': PIN_MEMORY, 'drop_last': True, # Drop last train batch
+                # Set prefetch_factor only if workers > 0
+                **({'prefetch_factor': 2} if NUM_DATALOADER_WORKERS > 0 else {}),
+                'persistent_workers': PERSISTENT_WORKERS # Already checks workers > 0
+            }
+            # KB Loaders
+            if kb_dataset_ok and full_kb_dataset_obj:
+                indices = list(range(len(full_kb_dataset_obj))); random.shuffle(indices)
+                split_idx = int(np.floor((1.0 - VAL_SPLIT) * len(indices)))
+                train_idx, val_idx = indices[:split_idx], indices[split_idx:]
+                kb_train_seqs, kb_val_seqs = len(train_idx), len(val_idx)
+                print(f"  KB Split: Train={kb_train_seqs}, Val={kb_val_seqs} sequences.")
+                if kb_train_seqs >= BATCH_SIZE_INITIAL:
+                    try:
+                        train_subset_kb = Subset(full_kb_dataset_obj, train_idx)
+                        keyboard_train_loader = DataLoader(train_subset_kb, shuffle=True, **loader_args)
+                        print(f"  KB Train Loader: {len(keyboard_train_loader)} batches (BS={BATCH_SIZE_INITIAL})")
+                        if kb_val_seqs > 0:
+                            val_args_kb = loader_args.copy(); val_bs_kb = max(1, BATCH_SIZE_INITIAL*2) # Larger val BS is fine
+                            val_args_kb.update({'batch_size': val_bs_kb, 'shuffle': False, 'drop_last': False, 'persistent_workers': False})
+                            if val_args_kb['num_workers'] == 0 and 'prefetch_factor' in val_args_kb: del val_args_kb['prefetch_factor']
+                            val_subset_kb = Subset(full_kb_dataset_obj, val_idx)
+                            keyboard_val_loader = DataLoader(val_subset_kb, **val_args_kb)
+                            print(f"  KB Val Loader: {len(keyboard_val_loader)} batches (BS={val_bs_kb})")
+                        else: print("  Warn: No validation samples for KB.")
+                        kb_loader_ok = True
+                    except Exception as e_dl: keyboard_skip_reason = f"KB Loader Error: {type(e_dl).__name__}"; print(f"ERROR: {keyboard_skip_reason}"); traceback.print_exc(limit=1); keyboard_train_loader=None; keyboard_val_loader=None
+                else: keyboard_skip_reason = f"Skipped - <{BATCH_SIZE_INITIAL} KB train seqs after split"; print(f"  Warning: {keyboard_skip_reason}")
+
+            # Mouse Loaders
+            if mouse_dataset_ok and full_mouse_dataset_obj:
+                indices = list(range(len(full_mouse_dataset_obj))); random.shuffle(indices)
+                split_idx = int(np.floor((1.0 - VAL_SPLIT) * len(indices)))
+                train_idx, val_idx = indices[:split_idx], indices[split_idx:]
+                mouse_train_seqs, mouse_val_seqs = len(train_idx), len(val_idx)
+                print(f"  Mouse Split: Train={mouse_train_seqs}, Val={mouse_val_seqs} sequences.")
+                if mouse_train_seqs >= BATCH_SIZE_INITIAL:
+                    try:
+                        train_subset_mouse = Subset(full_mouse_dataset_obj, train_idx)
+                        mouse_train_loader = DataLoader(train_subset_mouse, shuffle=True, **loader_args)
+                        print(f"  Mouse Train Loader: {len(mouse_train_loader)} batches (BS={BATCH_SIZE_INITIAL})")
+                        if mouse_val_seqs > 0:
+                            val_args_mouse = loader_args.copy(); val_bs_mouse = max(1, BATCH_SIZE_INITIAL*2)
+                            val_args_mouse.update({'batch_size': val_bs_mouse, 'shuffle': False, 'drop_last': False, 'persistent_workers': False})
+                            if val_args_mouse['num_workers'] == 0 and 'prefetch_factor' in val_args_mouse: del val_args_mouse['prefetch_factor']
+                            val_subset_mouse = Subset(full_mouse_dataset_obj, val_idx)
+                            mouse_val_loader = DataLoader(val_subset_mouse, **val_args_mouse)
+                            print(f"  Mouse Val Loader: {len(mouse_val_loader)} batches (BS={val_bs_mouse})")
+                        else: print("  Warn: No validation samples for Mouse.")
+                        mouse_loader_ok = True
+                    except Exception as e_dl: mouse_skip_reason = f"Mouse Loader Error: {type(e_dl).__name__}"; print(f"ERROR: {mouse_skip_reason}"); traceback.print_exc(limit=1); mouse_train_loader=None; mouse_val_loader=None
+                else: mouse_skip_reason = f"Skipped - <{BATCH_SIZE_INITIAL} Mouse train seqs after split"; print(f"  Warning: {mouse_skip_reason}")
+
+            cleanup_memory(); print("-" * 30)
+
+            # --- Keyboard AI Training ---
+            if kb_loader_ok:
+                print("Initializing Keyboard AI Model...")
+                kb_model, kb_crit, kb_optim, kb_sched = None, None, None, None # Clear refs
+                try:
+                    kb_model = VisionSequenceModel( # Instantiate
+                        vision_model_name=VISION_MODEL_NAME, pretrained_model_path=PRETRAINED_MODEL_DIR,
+                        tile_size=TILE_SIZE, num_tiles_total=total_tiles, sequence_length=SEQUENCE_LENGTH,
+                        transformer_d_model=TRANSFORMER_D_MODEL, transformer_nhead=TRANSFORMER_NHEAD,
+                        transformer_num_layers=TRANSFORMER_NUM_LAYERS, transformer_dim_feedforward=TRANSFORMER_DIM_FEEDFORWARD,
+                        transformer_dropout=TRANSFORMER_DROPOUT,
+                        num_keyboard_classes=num_keyboard_classes, num_mouse_actions=0, freeze_vision=False)
+                    # Loss: BCE for multi-label KB. Use reduction='none' for weighting in train_model.
+                    kb_crit = nn.BCEWithLogitsLoss(reduction='none').to(device)
+                    kb_optim = optim.AdamW(kb_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+                    kb_sched_patience = max(1, PATIENCE_EARLY_STOPPING // 2) # Scheduler patience shorter than early stop
+                    kb_sched = ReduceLROnPlateau(kb_optim, mode='min', factor=0.2, patience=kb_sched_patience, verbose=False)
+                    print(f"  KB Scheduler: ReduceLROnPlateau (Factor=0.2, Patience={kb_sched_patience})")
+
+                    keyboard_train_result = train_model( # Run Training
+                        model=kb_model, model_name='Keyboard AI',
+                        train_loader=keyboard_train_loader, val_loader=keyboard_val_loader,
+                        optimizer=kb_optim, scheduler=kb_sched, keyboard_criterion=kb_crit,
+                        device=device, batch_size_start=BATCH_SIZE_INITIAL, time_limit_sec=TRAINING_TIME_LIMIT_PER_MODEL_SEC)
+                    print(f"Keyboard AI Training finished. Reason: {keyboard_train_result.stop_reason}")
+
+                except Exception as e_kb_setup:
+                     print(f"ERROR Setting up/Running Keyboard AI training: {e_kb_setup}"); traceback.print_exc(limit=1)
+                     keyboard_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,f"KB Setup/Train Crash: {type(e_kb_setup).__name__}")
+                     main_error_occurred = True; error_msg_main += " | KB Train Crash" # Flag for final summary
+                finally: del kb_model, kb_crit, kb_optim, kb_sched; cleanup_memory() # Explicit cleanup
+            else: # KB loader failed/skipped
+                 keyboard_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,keyboard_skip_reason)
+                 print(f"Skipping Keyboard AI training: {keyboard_skip_reason}")
+
+            cleanup_memory(); print("-" * 30)
+
+            # --- Mouse AI Training ---
+            if mouse_loader_ok:
+                print("Initializing Mouse AI Model...")
+                mouse_model, m_act_crit, m_pos_crit, m_optim, m_sched = None, None, None, None, None # Clear refs
+                try:
+                    mouse_model = VisionSequenceModel( # Instantiate
+                        vision_model_name=VISION_MODEL_NAME, pretrained_model_path=PRETRAINED_MODEL_DIR,
+                        tile_size=TILE_SIZE, num_tiles_total=total_tiles, sequence_length=SEQUENCE_LENGTH,
+                        transformer_d_model=TRANSFORMER_D_MODEL, transformer_nhead=TRANSFORMER_NHEAD,
+                        transformer_num_layers=TRANSFORMER_NUM_LAYERS, transformer_dim_feedforward=TRANSFORMER_DIM_FEEDFORWARD,
+                        transformer_dropout=TRANSFORMER_DROPOUT,
+                        num_keyboard_classes=0, num_mouse_actions=num_mouse_action_classes, freeze_vision=False)
+                    # Losses: BCE for action (like multi-label), MSE for position. Use reduction='none'.
+                    m_act_crit = nn.BCEWithLogitsLoss(reduction='none').to(device)
+                    m_pos_crit = nn.MSELoss(reduction='none').to(device)
+                    m_optim = optim.AdamW(mouse_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+                    m_sched_patience = max(1, PATIENCE_EARLY_STOPPING // 2)
+                    m_sched = ReduceLROnPlateau(m_optim, mode='min', factor=0.2, patience=m_sched_patience, verbose=False)
+                    print(f"  Mouse Scheduler: ReduceLROnPlateau (Factor=0.2, Patience={m_sched_patience})")
+
+                    mouse_train_result = train_model( # Run Training
+                        model=mouse_model, model_name='Mouse AI',
+                        train_loader=mouse_train_loader, val_loader=mouse_val_loader,
+                        optimizer=m_optim, scheduler=m_sched,
+                        mouse_action_criterion=m_act_crit, mouse_pos_criterion=m_pos_crit,
+                        device=device, batch_size_start=BATCH_SIZE_INITIAL,
+                        time_limit_sec=TRAINING_TIME_LIMIT_PER_MODEL_SEC, mouse_pos_weight=MOUSE_POS_LOSS_WEIGHT)
+                    print(f"Mouse AI Training finished. Reason: {mouse_train_result.stop_reason}")
+
+                except Exception as e_mouse_setup:
+                     print(f"ERROR Setting up/Running Mouse AI training: {e_mouse_setup}"); traceback.print_exc(limit=1)
+                     mouse_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,f"Mouse Setup/Train Crash: {type(e_mouse_setup).__name__}")
+                     main_error_occurred = True; error_msg_main += " | Mouse Train Crash" # Flag for final summary
+                finally: del mouse_model, m_act_crit, m_pos_crit, m_optim, m_sched; cleanup_memory()
+            else: # Mouse loader failed/skipped
+                mouse_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,mouse_skip_reason)
+                print(f"Skipping Mouse AI training: {mouse_skip_reason}")
+
+            cleanup_memory(); print("-" * 30)
+
+            # --- Saving Trained Models ---
+            print("--- Saving Trained Models ---")
+            # Save Keyboard Model
+            if keyboard_train_result and keyboard_train_result.best_model_state_cpu:
+                 kb_info = { # Assemble metadata
+                     'name': 'Keyboard AI', 'epochs': keyboard_train_result.epochs_run,
+                     'batch_size': keyboard_train_result.final_batch_size, 'reason': keyboard_train_result.stop_reason,
+                     'saved_best_flag': keyboard_train_result.saved_best_state_flag,
+                     'vision_model_name': VISION_MODEL_NAME, 'sequence_length': SEQUENCE_LENGTH, 'tile_size': TILE_SIZE,
+                     'num_tiles_m': m_tiles, 'num_tiles_n': n_tiles, 'num_tiles_total': total_tiles,
+                     'screen_resolution': current_screen_resolution,
+                     'transformer_d_model': TRANSFORMER_D_MODEL, 'transformer_nhead': TRANSFORMER_NHEAD,
+                     'transformer_num_layers': TRANSFORMER_NUM_LAYERS, 'transformer_dim_feedforward': TRANSFORMER_DIM_FEEDFORWARD,
+                     'transformer_dropout': TRANSFORMER_DROPOUT, 'data_augmentation': ADD_DATA_AUGMENTATION,
+                     'train_samples': kb_train_seqs, 'val_samples': kb_val_seqs,
+                     'key_to_idx': key_to_idx, 'idx_to_key': idx_to_key, 'num_classes': num_keyboard_classes
+                 }
+                 kb_saved_final = save_model_checkpoint(keyboard_train_result.best_model_state_cpu, KEYBOARD_MODEL_FILE, OLD_KEYBOARD_MODEL_FILE, kb_info)
+            elif keyboard_train_result: print(f"No best keyboard model state obtained (Reason: {keyboard_train_result.stop_reason}). Not saving.")
+            else: print("Keyboard AI training skipped or failed before state capture. Not saving.")
+
+            # Save Mouse Model
+            if mouse_train_result and mouse_train_result.best_model_state_cpu:
+                 mouse_info = { # Assemble metadata
+                     'name': 'Mouse AI', 'epochs': mouse_train_result.epochs_run,
+                     'batch_size': mouse_train_result.final_batch_size, 'reason': mouse_train_result.stop_reason,
+                     'saved_best_flag': mouse_train_result.saved_best_state_flag,
+                     'vision_model_name': VISION_MODEL_NAME, 'sequence_length': SEQUENCE_LENGTH, 'tile_size': TILE_SIZE,
+                     'num_tiles_m': m_tiles, 'num_tiles_n': n_tiles, 'num_tiles_total': total_tiles,
+                     'screen_resolution': current_screen_resolution,
+                     'transformer_d_model': TRANSFORMER_D_MODEL, 'transformer_nhead': TRANSFORMER_NHEAD,
+                     'transformer_num_layers': TRANSFORMER_NUM_LAYERS, 'transformer_dim_feedforward': TRANSFORMER_DIM_FEEDFORWARD,
+                     'transformer_dropout': TRANSFORMER_DROPOUT, 'data_augmentation': ADD_DATA_AUGMENTATION,
+                     'train_samples': mouse_train_seqs, 'val_samples': mouse_val_seqs,
+                     'mouse_action_to_idx': mouse_action_to_idx, 'num_action_classes': num_mouse_action_classes,
+                     'mouse_pos_loss_weight': MOUSE_POS_LOSS_WEIGHT
+                 }
+                 mouse_saved_final = save_model_checkpoint(mouse_train_result.best_model_state_cpu, MOUSE_MODEL_FILE, OLD_MOUSE_MODEL_FILE, mouse_info)
+            elif mouse_train_result: print(f"No best mouse model state obtained (Reason: {mouse_train_result.stop_reason}). Not saving.")
+            else: print("Mouse AI training skipped or failed before state capture. Not saving.")
+
+        else: # Case where preprocessing succeeded but df_aligned was None/empty or tiling failed
+            main_error_occurred = True
+            error_msg_main = "Preprocessing Succeeded Structurally but No Actionable Data/Tiling"
+            print(f"WARNING: {error_msg_main}. Cannot train.")
+             # Populate default error results if not set later
+            if not keyboard_train_result: keyboard_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,error_msg_main)
+            if not mouse_train_result: mouse_train_result = TrainResult(None,0,BATCH_SIZE_INITIAL,None,False,error_msg_main)
+
+    # --- Global Exception Handling (Catch errors during main setup/execution) ---
+    except ValueError as ve: print(f"\n--- CONFIG/VALUE ERROR (MAIN): {ve}"); traceback.print_exc(limit=1); main_error_occurred=True; error_msg_main = f"ValueError: {str(ve)[:100]}"
+    except FileNotFoundError as fnf: print(f"\n--- FILE NOT FOUND (MAIN): {fnf}"); traceback.print_exc(limit=1); main_error_occurred=True; error_msg_main = f"FileNotFound: {str(fnf)[:100]}"
+    except torch.cuda.OutOfMemoryError as oom: print(f"\n--- OOM ERROR (MAIN): {oom} ---"); print(" Suggest reducing BATCH_SIZE_INITIAL / SEQUENCE_LENGTH."); main_error_occurred=True; error_msg_main = "OOM Error (Main Scope)"
+    except Exception as e: print(f"\n--- UNEXPECTED ERROR (MAIN): {type(e).__name__}: {e}"); traceback.print_exc(); main_error_occurred=True; error_msg_main = f"Unexpected Crash: {type(e).__name__}"
+
+    # --- Final Summary and Cleanup ---
+    finally:
+        print("\n" + "="*65)
+        print("--- Training Run Summary ---")
+        print(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Set final results to error if a main error occurred and specific result wasn't set
+        if main_error_occurred:
+             kb_saved_final = mouse_saved_final = False # Ensure save flags are false on error
+             final_stop_reason = f"Run Failed ({error_msg_main})" if error_msg_main else "Run Failed (Unknown Main Error)"
+             if not keyboard_train_result: keyboard_train_result = TrainResult(None, 0, BATCH_SIZE_INITIAL, None, False, final_stop_reason)
+             if not mouse_train_result: mouse_train_result = TrainResult(None, 0, BATCH_SIZE_INITIAL, None, False, final_stop_reason)
+
+        # Preprocessing Summary
+        preproc_status = "N/A"; num_aligned_final = "N/A"
+        if preprocessing_info:
+             preproc_status = "Success" if preprocessing_info.success_flag else "Failed/Skipped"
+             # Get num_aligned safely, handling deleted/None df_aligned
+             if preprocessing_info.success_flag:
+                 # Check if df_aligned exists AND is not None before accessing len
+                 if hasattr(preprocessing_info, 'df_aligned') and preprocessing_info.df_aligned is not None:
+                      num_aligned_final = len(preprocessing_info.df_aligned)
+                 # Fallback using local variable if df_aligned was deleted but count was stored
+                 elif 'num_total_aligned' in locals() and isinstance(locals()['num_total_aligned'], int):
+                     num_aligned_final = locals()['num_total_aligned']
+                 else: num_aligned_final = "?" # Fallback if unavailable
+             else: num_aligned_final = 0 # Failed preproc means 0 aligned
+        print(f"Preprocessing Status: {preproc_status}")
+        if preproc_status == "Success": print(f"Aligned Samples Found (Actionable): {num_aligned_final}")
+
+        # Runtime Env Summary
+        print(f"Device Used: {device.type}" if device else "N/A (Setup Failed?)")
+        print(f"ViT Backbone: {VISION_MODEL_NAME}")
+        res_str = f"{current_screen_resolution[0]}x{current_screen_resolution[1]}" if current_screen_resolution else 'N/A'
+        print(f"SeqLen: {SEQUENCE_LENGTH}, Tile Size: {TILE_SIZE}, Screen Res: {res_str}, Tiling: {m_tiles}x{n_tiles}={total_tiles}")
+        print(f"Arch: Tiled ViT -> Temp Transformer(L:{TRANSFORMER_NUM_LAYERS},H:{TRANSFORMER_NHEAD},D:{TRANSFORMER_D_MODEL})")
+        print("-" * 30)
+
+        # Report dataset load errors
+        if full_kb_dataset_obj: full_kb_dataset_obj.report_load_errors()
+        if full_mouse_dataset_obj: full_mouse_dataset_obj.report_load_errors()
+        if full_kb_dataset_obj or full_mouse_dataset_obj: print("-" * 30)
+
+        # --- Keyboard AI Summary ---
+        print("Keyboard AI:")
+        if keyboard_train_result:
+             bs_kb = keyboard_train_result.final_batch_size if keyboard_train_result.epochs_run > 0 or "skip" not in keyboard_train_result.stop_reason.lower() else 'N/A'
+             print(f"  Stop Reason    : {keyboard_train_result.stop_reason}")
+             print(f"  Train/Val Seqs : {kb_train_seqs:<6} / {kb_val_seqs:<6} | Classes: {num_keyboard_classes}")
+             print(f"  Epochs Run     : {keyboard_train_result.epochs_run:<3} | Initial Batch Size: {bs_kb}")
+             kb_best_str = "(Best Val State)" if keyboard_train_result.saved_best_state_flag and kb_saved_final else ""
+             print(f"  Model Saved    : {'Yes' if kb_saved_final else 'No'} {kb_best_str}")
+             if kb_saved_final: print(f"  Saved To       : {KEYBOARD_MODEL_FILE.name}")
+        elif main_error_occurred: print(f"  Status: Not Run/Initialized ({error_msg_main})")
+        else: print("  Status: Not Run/Initialized")
+
+        print("-" * 30)
+        # --- Mouse AI Summary ---
+        print("Mouse AI:")
+        if mouse_train_result:
+             bs_mouse = mouse_train_result.final_batch_size if mouse_train_result.epochs_run > 0 or "skip" not in mouse_train_result.stop_reason.lower() else 'N/A'
+             print(f"  Stop Reason    : {mouse_train_result.stop_reason}")
+             print(f"  Train/Val Seqs : {mouse_train_seqs:<6} / {mouse_val_seqs:<6} | Classes: {num_mouse_action_classes}")
+             print(f"  Epochs Run     : {mouse_train_result.epochs_run:<3} | Initial Batch Size: {bs_mouse}")
+             mouse_best_str = "(Best Val State)" if mouse_train_result.saved_best_state_flag and mouse_saved_final else ""
+             print(f"  Model Saved    : {'Yes' if mouse_saved_final else 'No'} {mouse_best_str}")
+             if mouse_saved_final: print(f"  Saved To       : {MOUSE_MODEL_FILE.name}")
+        elif main_error_occurred: print(f"  Status: Not Run/Initialized ({error_msg_main})")
+        else: print("  Status: Not Run/Initialized")
+
+        print("-" * 30)
+        print("Final cleanup...")
+        # Delete large objects explicitly (use try as they might not exist)
+        objects_to_del = [
+             'keyboard_train_result', 'mouse_train_result', 'screenshot_list_full',
+             'full_kb_dataset_obj', 'full_mouse_dataset_obj', 'keyboard_train_loader',
+             'keyboard_val_loader', 'mouse_train_loader', 'mouse_val_loader',
+             'key_to_idx', 'idx_to_key', 'mouse_action_to_idx', 'preprocessing_info'
+        ]
+        # Use a loop with locals() or globals() check for safety
+        local_vars = locals()
+        for obj_name in objects_to_del:
+            if obj_name in local_vars:
+                try:
+                    del local_vars[obj_name]
+                except NameError: # Should not happen if check passed, but for safety
+                    pass
+        cleanup_memory() # Final GC and CUDA clear
+
+        total_script_time = time.time() - main_start_time
+        print(f"\nTotal script execution time: {total_script_time:.2f} seconds ({timedelta(seconds=int(total_script_time))}).")
+        print("="*65)
+        print("    Transformer Training Script Finished")
+        print("="*65)
+        sys.exit(0) # Explicitly exit with success code
